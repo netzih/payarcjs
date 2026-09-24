@@ -17,3 +17,4 @@ javascript-syntax:
   image: node:22-alpine
   script:
     - node --check js/payarcjs.js
+    - node --check js/payarc-hostedfields.js

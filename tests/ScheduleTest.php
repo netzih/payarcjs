@@ -13,6 +13,25 @@ final class ScheduleTest extends TestCase {
     );
   }
 
+  public function testInvoiceIDCarriesTheSiteTag(): void {
+    $tag = CRM_Payarcjs_Schedule::siteTag('site key');
+    self::assertMatchesRegularExpression('/^[0-9a-f]{6}$/', $tag);
+    self::assertSame($tag, CRM_Payarcjs_Schedule::siteTag('site key'));
+    self::assertNotSame($tag, CRM_Payarcjs_Schedule::siteTag('another site'));
+    self::assertSame('', CRM_Payarcjs_Schedule::siteTag(''));
+    self::assertSame('payarcjs-' . $tag . '-6-2026-09-10-1', CRM_Payarcjs_Schedule::invoiceID(6, '2026-09-10', 1, $tag));
+    // Anything but lowercase letters and digits is dropped, so the reference
+    // stays a valid Idempotency-Key.
+    self::assertSame('payarcjs-ab12-6-2026-09-10-0', CRM_Payarcjs_Schedule::invoiceID(6, '2026-09-10', 0, 'AB-12 '));
+  }
+
+  public function testLostAnswersAreReplayedWithinTheHourThenLookedUp(): void {
+    self::assertSame('replay', CRM_Payarcjs_Schedule::reconcileStep(0));
+    self::assertSame('replay', CRM_Payarcjs_Schedule::reconcileStep(CRM_Payarcjs_Schedule::REPLAY_WINDOW - 1));
+    self::assertSame('lookup', CRM_Payarcjs_Schedule::reconcileStep(CRM_Payarcjs_Schedule::REPLAY_WINDOW));
+    self::assertSame('lookup', CRM_Payarcjs_Schedule::reconcileStep(3 * 86400));
+  }
+
   public function testInvoiceIDRejectsUnusableDates(): void {
     $this->expectException(InvalidArgumentException::class);
     CRM_Payarcjs_Schedule::invoiceID(6, 'now', 0);
@@ -56,12 +75,13 @@ final class ScheduleTest extends TestCase {
     self::assertSame('2026-09-09 06:05:57', CRM_Payarcjs_Schedule::reconcileRetryDate($now));
   }
 
-  public function testExpiryDateFromMMYY(): void {
-    self::assertSame('2029-12-31', CRM_Payarcjs_Schedule::expiryDate('1229'));
-    self::assertSame('2028-02-29', CRM_Payarcjs_Schedule::expiryDate('02/28'));
-    self::assertSame('2027-06-30', CRM_Payarcjs_Schedule::expiryDate('062027'));
-    self::assertNull(CRM_Payarcjs_Schedule::expiryDate(''));
-    self::assertNull(CRM_Payarcjs_Schedule::expiryDate('1329'));
+  public function testExpiryDateFromMonthAndYear(): void {
+    self::assertSame('2029-12-31', CRM_Payarcjs_Schedule::expiryDate('12', '2029'));
+    self::assertSame('2028-02-29', CRM_Payarcjs_Schedule::expiryDate('2', '28'));
+    self::assertSame('2027-06-30', CRM_Payarcjs_Schedule::expiryDate('06', '2027'));
+    self::assertNull(CRM_Payarcjs_Schedule::expiryDate(NULL, NULL));
+    self::assertNull(CRM_Payarcjs_Schedule::expiryDate('13', '2029'));
+    self::assertNull(CRM_Payarcjs_Schedule::expiryDate('12', '229'));
   }
 
 }

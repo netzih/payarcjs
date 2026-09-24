@@ -1,52 +1,39 @@
 {*
-  Field help for the PayArc Pay.js payment processor settings form.
+  Field help for the PayArc Hosted Fields payment processor settings form.
   CiviCRM appends this file to core's PaymentProcessor.hlp; the ids match
   "{payment processor type name}_{field name}" as rendered by
   CRM/Admin/Form/PaymentProcessor/Details.tpl.
 *}
 {crmScope extensionKey='org.chabadrichmond.payarcjs'}
 
-{capture assign=payarcjsKeyHelp}
-<p>{ts}In the PayArc merchant console go to <strong>Settings &raquo; API Keys</strong> (older consoles: <strong>Settings &raquo; Source Keys</strong>) and add a key for CiviCRM. Copy the key exactly; live keys are a long string, sandbox keys start with an underscore.{/ts}</p>
-<p>{ts}On that key, allow these commands:{/ts}</p>
-<ul>
-  <li><strong>{ts}Sale{/ts}</strong> - {ts}one-time gifts and the first charge of a recurring gift{/ts}</li>
-  <li><strong>{ts}Auth Only{/ts}</strong> {ts}and{/ts} <strong>{ts}Void{/ts}</strong> - {ts}the "Change Billing Details" action, which verifies a replacement card with a small authorization that is voided at once, and full refunds of same-day charges{/ts}</li>
-  <li><strong>{ts}Credit{/ts}</strong> - {ts}refunds issued from CiviCRM (PayArc's name for a refund). Without it, refunds fail with "Transaction type not allowed from this source".{/ts}</li>
-</ul>
-<p>{ts}Use a separate key for CiviCRM rather than sharing one with another system, so it can be rotated on its own and its transactions are easy to tell apart in PayArc reports.{/ts}</p>
+{capture assign=payarcjsTokenHelp}
+<p>{ts}In the PayArc dashboard open <strong>API</strong> and press the eye icon beside the <strong>bearer token</strong> (the "access token") to show it, then copy all of it. It is a long string of about a thousand characters, so it goes in this larger box.{/ts}</p>
+<p>{ts}The bearer token is secret: it can charge and refund cards. CiviCRM keeps it on the server and never sends it to the browser. Anyone who has seen it should have it regenerated in the dashboard, and the new one entered here.{/ts}</p>
 {/capture}
 
-{capture assign=payarcjsPinHelp}
-<p>{ts}The PIN is set on the API key itself in the PayArc console (edit the key, then <strong>PIN</strong>). It is required: CiviCRM signs every request with the key and this PIN, and PayArc rejects requests from keys with no PIN.{/ts}</p>
-<p>{ts}Enter the same value here. Changing the PIN in PayArc without updating it here stops all payments with "API authentication failed".{/ts}</p>
-{/capture}
-
-{capture assign=payarcjsPublicKeyHelp}
-<p>{ts}The Pay.js public key is generated from the same API key in the PayArc console (edit the key, then <strong>Pay.js</strong> or <strong>Public Key</strong>, and generate one). It is embedded in the donation page so the card details go straight from the donor's browser to PayArc and never touch this server.{/ts}</p>
-<p>{ts}A public key alone cannot charge cards, so it is safe to expose in the page. It must belong to the same API key entered above and to the same environment (live or sandbox), or the card box shows "The payment form is not configured correctly".{/ts}</p>
+{capture assign=payarcjsClientIdHelp}
+<p>{ts}On the same <strong>API</strong> page of the PayArc dashboard, press the eye icon beside the <strong>Client ID</strong> and copy it.{/ts}</p>
+<p>{ts}The Client ID is public: it is sent to the donation page so PayArc's hosted card fields can load, and the card details go straight from the donor's browser to PayArc without touching this server. It cannot charge cards on its own. It must belong to the same PayArc account and environment (live or sandbox) as the bearer token above, or the card fields do not load. The System Status page reports a Client ID that PayArc does not recognise.{/ts}</p>
 {/capture}
 
 {capture assign=payarcjsUrlHelp}
-<p>{ts}The PayArc REST API endpoint. Use the default unless PayArc tells you otherwise:{/ts}</p>
+<p>{ts}The PayArc API endpoint. Use the default:{/ts}</p>
 <ul>
-  <li>{ts}Live:{/ts} <code>https://secure.payarc.com/api/v2</code></li>
-  <li>{ts}Sandbox:{/ts} <code>https://sandbox.payarc.com/api/v2</code></li>
+  <li>{ts}Live:{/ts} <code>https://api.payarc.net/v1</code></li>
+  <li>{ts}Sandbox:{/ts} <code>https://testapi.payarc.net/v1</code></li>
 </ul>
-<p>{ts}The card box script (Pay.js) follows this host automatically, so a processor pointed at the sandbox also loads the sandbox card form. The System Status page warns when the live settings point at the sandbox or the test settings at the live host.{/ts}</p>
+<p>{ts}The hosted card fields follow this host automatically (portal.payarc.net or testportal.payarc.net), so a processor pointed at the sandbox also loads the sandbox card fields. The System Status page warns when the live settings point at the sandbox or the test settings at the live host.{/ts}</p>
 {/capture}
 
 {capture assign=payarcjsTestNote}
-<p>{ts}These are the credentials used in test mode (contribution page previews and the test-mode back-office form). They come from a PayArc <strong>sandbox</strong> account, which is separate from the live merchant account, and are checked against the sandbox URL below.{/ts}</p>
+<p>{ts}These are the credentials used in test mode (contribution page previews and the test-mode back-office form). They come from a PayArc <strong>sandbox</strong> account (testportal.payarc.net), which is separate from the live merchant account, and are used with the sandbox URL below.{/ts}</p>
 {/capture}
 
-{htxt id='PayArcHostedFields_user_name'}{$payarcjsKeyHelp}{/htxt}
-{htxt id='PayArcHostedFields_password'}{$payarcjsPinHelp}{/htxt}
-{htxt id='PayArcHostedFields_signature'}{$payarcjsPublicKeyHelp}{/htxt}
+{htxt id='PayArcHostedFields_user_name'}{$payarcjsClientIdHelp}{/htxt}
+{htxt id='PayArcHostedFields_signature'}{$payarcjsTokenHelp}{/htxt}
 {htxt id='PayArcHostedFields_url_site'}{$payarcjsUrlHelp}{/htxt}
-{htxt id='PayArcHostedFields_test_user_name'}{$payarcjsTestNote}{$payarcjsKeyHelp}{/htxt}
-{htxt id='PayArcHostedFields_test_password'}{$payarcjsTestNote}{$payarcjsPinHelp}{/htxt}
-{htxt id='PayArcHostedFields_test_signature'}{$payarcjsTestNote}{$payarcjsPublicKeyHelp}{/htxt}
+{htxt id='PayArcHostedFields_test_user_name'}{$payarcjsTestNote}{$payarcjsClientIdHelp}{/htxt}
+{htxt id='PayArcHostedFields_test_signature'}{$payarcjsTestNote}{$payarcjsTokenHelp}{/htxt}
 {htxt id='PayArcHostedFields_test_url_site'}{$payarcjsTestNote}{$payarcjsUrlHelp}{/htxt}
 
 {/crmScope}

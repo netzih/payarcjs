@@ -1,77 +1,134 @@
-/* The Pay.js iframe is sized as height:100% of its container, and the card
-   row inside it is a single flex line, so the container needs a fixed height
-   or the iframe falls back to the browser default of 150px. */
-.payarcjs-payment-container #payarcjs-card-element {
+/* PayArc Hosted Fields put one iframe in each field container (card number,
+   MM/YY, CVV, ZIP). The iframes are sized as 100% of their container, so each
+   container gets a fixed height; the border and focus styles of the inputs
+   themselves live inside the iframes (see DEFAULT_CSS in
+   payarc-hostedfields.js). From payarc-wordpress payarc-payments.css. */
+.payarcjs-payment-container .payarc-card-element {
+  display: block;
   box-sizing: border-box;
-  height: 44px;
   max-width: 520px;
-  padding: 0 8px;
+}
+/* The helper's hidden "initiate" button and status element: theme rules
+   such as button { display: inline-flex } would otherwise outrank the
+   hidden attribute and show an empty button under the fields. */
+.payarcjs-payment-container .payarc-card-element > [hidden] {
+  display: none !important;
+}
+.payarcjs-payment-container .payarc-fields {
+  /* One box, like a single card input: number, MM/YY, CVV and ZIP side by
+     side with thin dividers. The inputs inside the iframes are borderless
+     (see FIELD_CSS in payarcjs.js), so this box draws the border. */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px 60px 76px;
+  box-sizing: border-box;
   border: 1px solid #8c8f94;
   border-radius: 4px;
   background: #fff;
   overflow: hidden;
 }
-
-.payarcjs-payment-container #payarcjs-card-element iframe {
-  display: block;
-  width: 100%;
-  height: 100%;
-  border: 0;
-}
-
-.payarcjs-payment-container #payarcjs-card-element:focus-within {
+.payarcjs-payment-container .payarc-fields:focus-within,
+.payarcjs-payment-container .payarc-fields.payarc-focused {
   border-color: #2271b1;
   box-shadow: 0 0 0 1px #2271b1;
 }
-
-.payarcjs-payment-container .payarcjs-card-errors:empty {
-  display: none;
+.payarcjs-payment-container .payarc-fields:has(.payarc-field[data-validation="error"]) {
+  border-color: #b32d2e;
+  box-shadow: none;
+}
+.payarcjs-payment-container .payarc-field {
+  display: block;
+  height: 42px;
+  min-width: 0;
+  overflow: hidden;
+}
+.payarcjs-payment-container .payarc-field + .payarc-field {
+  border-left: 1px solid #dcdcde;
+}
+/* PayArc writes style="all: inherit" on each iframe, which would size it
+   from the container's auto width (the 300px iframe default); only an
+   !important rule outranks an inline declaration. */
+.payarcjs-payment-container .payarc-field iframe {
+  display: block !important;
+  width: 100% !important;
+  height: 100% !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+}
+/* Phones: the number on its own row, the other three below it. */
+@media (max-width: 440px) {
+  .payarcjs-payment-container .payarc-fields {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .payarcjs-payment-container .payarc-field-number {
+    grid-column: 1 / -1;
+  }
+  .payarcjs-payment-container .payarc-field + .payarc-field {
+    border-top: 1px solid #dcdcde;
+  }
+  .payarcjs-payment-container .payarc-field-exp {
+    border-left: 0;
+  }
 }
 
-.payarcjs-payment-container .payarcjs-card-errors {
+.payarcjs-payment-container .payarc-card-errors {
   max-width: 520px;
   margin-top: 8px;
 }
-
+.payarcjs-payment-container .payarc-card-errors:empty {
+  display: none;
+}
 .payarcjs-payment-container .description {
   max-width: 520px;
   margin-top: 8px;
 }
 
-/* Apple Pay button (rendered by Pay.js as an -apple-pay-button div) above the
-   card box, with a divider. The whole block stays hidden unless Pay.js
-   confirms Apple Pay is available in this browser and on this account. */
-.payarcjs-payment-container .payarcjs-apple-pay {
+/* Wallet buttons above the card fields, with a divider. The block stays
+   hidden unless a wallet is enabled and offered in this browser. */
+.payarcjs-payment-container .payarc-wallets-wrapper {
   max-width: 520px;
   margin-bottom: 12px;
 }
-
-.payarcjs-payment-container .payarcjs-apple-pay-button {
-  min-height: 40px;
+.payarcjs-payment-container .payarc-wallets-wrapper[hidden] {
+  display: none;
 }
-
-.payarcjs-payment-container .payarcjs-apple-pay-button .apple-pay-button {
-  width: 100%;
-  height: 44px;
+.payarcjs-payment-container .payarc-wallets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.payarcjs-payment-container .payarc-wallet-button {
+  flex: 1 1 200px;
+  min-height: 44px;
+  padding: 0 16px;
+  border: 0;
   border-radius: 4px;
+  background: #000;
+  color: #fff;
+  font-size: 16px;
+  font-weight: 600;
   cursor: pointer;
 }
-
-.payarcjs-payment-container .payarcjs-apple-pay-divider {
+.payarcjs-payment-container .payarc-wallet-google-pay {
+  background: #1a73e8;
+}
+.payarcjs-payment-container .payarc-wallet-button:focus-visible {
+  outline: 2px solid #2271b1;
+  outline-offset: 2px;
+}
+.payarcjs-payment-container .payarc-wallet-divider {
   display: flex;
   align-items: center;
   margin: 12px 0 0;
   color: #646970;
   font-size: 0.9em;
 }
-
-.payarcjs-payment-container .payarcjs-apple-pay-divider::before,
-.payarcjs-payment-container .payarcjs-apple-pay-divider::after {
+.payarcjs-payment-container .payarc-wallet-divider::before,
+.payarcjs-payment-container .payarc-wallet-divider::after {
   content: "";
   flex: 1;
   border-top: 1px solid #c3c4c7;
 }
-
-.payarcjs-payment-container .payarcjs-apple-pay-divider span {
+.payarcjs-payment-container .payarc-wallet-divider span {
   padding: 0 10px;
 }

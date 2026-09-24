@@ -1,8 +1,11 @@
 <?php
 
 require_once __DIR__ . '/CRM/Payarcjs/ExtensionUtil.php';
+require_once __DIR__ . '/autoload.php';
 
 use CRM_Payarcjs_ExtensionUtil as E;
+use Payarc\GatewayClient;
+use Payarc\GatewayException;
 
 /**
  * Implements hook_civicrm_config().
@@ -37,21 +40,15 @@ function payarcjs_civicrm_buildForm($formName, &$form): void {
 }
 
 /**
- * Implements hook_civicrm_alterAPIPermissions().
- */
-function payarcjs_civicrm_alterAPIPermissions($entity, $action, &$params, &$permissions): void {
-  $permissions['payarcjs']['importtransactions'] = ['administer CiviContribute'];
-}
-
-/**
  * Implements hook_civicrm_check().
  *
- * Flags PayArc processors with missing credentials or an API URL that does
- * not match their live/test mode, and a disabled recurring-payment job.
+ * Flags PayArc processors with missing or rejected credentials or an API URL
+ * that does not match their live/test mode, In Progress series without a
+ * stored card, and a disabled recurring-payment job.
  */
 function payarcjs_civicrm_check(&$messages, $statusNames = [], $includeDisabled = FALSE): void {
   $processors = \Civi\Api4\PaymentProcessor::get(FALSE)
-    ->addSelect('id', 'name', 'is_test', 'user_name', 'password', 'signature', 'url_site')
+    ->addSelect('id', 'name', 'is_test', 'user_name', 'signature', 'url_site')
     ->addWhere('payment_processor_type_id:name', '=', 'PayArcHostedFields')
     ->addWhere('is_active', '=', TRUE)
     // APIv4 hides test processor records unless asked.
@@ -62,8 +59,12 @@ function payarcjs_civicrm_check(&$messages, $statusNames = [], $includeDisabled 
   foreach ($processors as $processor) {
     $mode = $processor['is_test'] ? E::ts('test') : E::ts('live');
     $hasLiveProcessor = $hasLiveProcessor || !$processor['is_test'];
+    $editAction = [
+      'path' => 'civicrm/admin/paymentProcessor/edit',
+      'query' => ['action' => 'update', 'id' => $processor['id'], 'reset' => 1],
+    ];
     $missing = [];
-    foreach (['user_name' => E::ts('API key'), 'password' => E::ts('API PIN'), 'signature' => E::ts('Pay.js public key')] as $field => $label) {
+    foreach (['signature' => E::ts('API bearer token'), 'user_name' => E::ts('Client ID')] as $field => $label) {
       if (trim((string) ($processor[$field] ?? '')) === '') {
         $missing[] = $label;
       }
@@ -76,31 +77,46 @@ function payarcjs_civicrm_check(&$messages, $statusNames = [], $includeDisabled 
           2 => $processor['name'],
           3 => implode(', ', $missing),
         ]),
-        E::ts('PayArc Pay.js: incomplete credentials'),
+        E::ts('PayArc: incomplete credentials'),
         $processor['is_test'] ? \Psr\Log\LogLevel::WARNING : \Psr\Log\LogLevel::ERROR,
         'fa-credit-card'
       );
-      $message->addAction(E::ts('Edit processor'), NULL, 'href', [
-        'path' => 'civicrm/admin/paymentProcessor/edit',
-        'query' => ['action' => 'update', 'id' => $processor['id'], 'reset' => 1],
-      ]);
+      $message->addAction(E::ts('Edit processor'), NULL, 'href', $editAction);
       $messages[] = $message;
+      continue;
     }
 
     $host = strtolower((string) parse_url((string) ($processor['url_site'] ?? ''), PHP_URL_HOST));
-    $isSandboxHost = str_contains($host, 'sandbox');
+    $isSandboxHost = str_starts_with($host, 'test');
     if ($host !== '' && $isSandboxHost !== (bool) $processor['is_test']) {
       $messages[] = new CRM_Utils_Check_Message(
         'payarcjsConfiguration_url_' . $processor['id'],
-        E::ts('The %1 settings of payment processor "%2" use the API URL %3, which does not match that mode. Live credentials belong with secure.payarc.com and sandbox credentials with sandbox.payarc.com.', [
+        E::ts('The %1 settings of payment processor "%2" use the API URL %3, which does not match that mode. Live credentials belong with api.payarc.net and sandbox credentials with testapi.payarc.net.', [
           1 => $mode,
           2 => $processor['name'],
           3 => $processor['url_site'],
         ]),
-        E::ts('PayArc Pay.js: API URL and mode differ'),
+        E::ts('PayArc: API URL and mode differ'),
         \Psr\Log\LogLevel::WARNING,
         'fa-credit-card'
       );
+    }
+
+    $problems = payarcjs_check_credentials($processor, $host !== '' ? $isSandboxHost : (bool) $processor['is_test']);
+    if ($problems) {
+      $message = new CRM_Utils_Check_Message(
+        'payarcjsConfiguration_rejected_' . $processor['id'],
+        E::ts('PayArc refused the %1 settings of payment processor "%2": %3', [
+          1 => $mode,
+          2 => $processor['name'],
+          3 => implode(' ', $problems),
+        ]),
+        E::ts('PayArc: credentials rejected'),
+        $processor['is_test'] ? \Psr\Log\LogLevel::WARNING : \Psr\Log\LogLevel::ERROR,
+        'fa-credit-card'
+      );
+      $message->addAction(E::ts('Edit processor'), NULL, 'href', $editAction);
+      $messages[] = $message;
     }
   }
 
@@ -119,7 +135,7 @@ function payarcjs_civicrm_check(&$messages, $statusNames = [], $includeDisabled 
       $message = new CRM_Utils_Check_Message(
         'payarcjsConfiguration_job',
         E::ts('The scheduled job "PayArc recurring card payments" is disabled, so recurring gifts through PayArc will not be charged.'),
-        E::ts('PayArc Pay.js: recurring job disabled'),
+        E::ts('PayArc: recurring job disabled'),
         \Psr\Log\LogLevel::WARNING,
         'fa-clock-o'
       );
@@ -130,10 +146,62 @@ function payarcjs_civicrm_check(&$messages, $statusNames = [], $includeDisabled 
 }
 
 /**
+ * Ask PayArc whether it accepts a processor's bearer token and Client ID,
+ * without moving money (one charge listed; one card-field session opened and
+ * left unused). Answers are cached for six hours per credential pair, so the
+ * System Status page does not call PayArc every time it loads. A PayArc that
+ * cannot be reached reports nothing: only a definite refusal is a problem.
+ *
+ * @return string[]
+ *   Problems, empty when both were accepted or PayArc could not be asked.
+ */
+function payarcjs_check_credentials(array $processor, bool $isSandbox): array {
+  $url = trim((string) ($processor['url_site'] ?? '')) ?: ($isSandbox ? GatewayClient::SANDBOX_URL : GatewayClient::LIVE_URL);
+  $cacheKey = 'payarcjs_credentials_' . hash('sha256', $url . "\n" . $processor['signature'] . "\n" . $processor['user_name']);
+  $cache = Civi::cache('long');
+  $cached = $cache->get($cacheKey);
+  if (is_array($cached)) {
+    return $cached;
+  }
+
+  $problems = [];
+  $reachable = TRUE;
+  try {
+    $client = new GatewayClient((string) $processor['signature'], $url, NULL, CRM_Core_Payment_Payarcjs::SOFTWARE);
+    try {
+      $client->verifyCredentials();
+    }
+    catch (\Payarc\AmbiguousGatewayException $e) {
+      $reachable = FALSE;
+    }
+    catch (GatewayException $e) {
+      $problems[] = E::ts('the API bearer token was refused (%1).', [1 => $e->getMessage()]);
+    }
+    try {
+      $client->verifyClientId((string) $processor['user_name'], $isSandbox ? GatewayClient::SANDBOX_PORTAL : GatewayClient::LIVE_PORTAL);
+    }
+    catch (\Payarc\AmbiguousGatewayException $e) {
+      $reachable = FALSE;
+    }
+    catch (GatewayException | InvalidArgumentException $e) {
+      $problems[] = E::ts('the Client ID is not recognised by PayArc, so the card fields will not load.');
+    }
+  }
+  catch (InvalidArgumentException $e) {
+    $problems[] = $e->getMessage();
+  }
+
+  if ($reachable || $problems) {
+    $cache->set($cacheKey, $problems, 6 * 3600);
+  }
+  return $problems;
+}
+
+/**
  * In Progress PayArc series with no stored card are never picked up by the
  * recurring job (it requires a token), so they would silently never charge.
- * This happens when the first charge was approved but the card token could
- * not be stored, and core later moved the series back to In Progress.
+ * This happens when the first charge was approved but the card reference
+ * could not be stored, and core later moved the series back to In Progress.
  */
 function payarcjs_check_recurs_without_token(array &$messages, array $processorIDs): void {
   if (!$processorIDs) {
@@ -164,7 +232,7 @@ function payarcjs_check_recurs_without_token(array &$messages, array $processorI
   $messages[] = new CRM_Utils_Check_Message(
     'payarcjsConfiguration_recur_without_token',
     E::ts('These recurring contributions are In Progress but have no stored PayArc card, so the recurring job will never charge them. Ask the donor to update the card (Change Billing Details) or cancel the series.') . '<ul>' . implode('', $items) . '</ul>',
-    E::ts('PayArc Pay.js: recurring gifts without a stored card'),
+    E::ts('PayArc: recurring gifts without a stored card'),
     \Psr\Log\LogLevel::WARNING,
     'fa-credit-card'
   );

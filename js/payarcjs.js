@@ -1,80 +1,51 @@
-/* global CRM, payarc */
+/* global CRM, PayarcHostedFields */
 /* jshint esversion: 8 */
 (function($, ts) {
   'use strict';
 
+  // CiviCRM inserts the billing block's scripts again whenever an AJAX form
+  // reloads it; the handlers registered below must only exist once. load()
+  // re-reads the form and CRM.vars on every call.
+  if (window.payarcjsLoaded) {
+    return;
+  }
+  window.payarcjsLoaded = true;
+
   const scriptName = 'payarcjs';
-  const tokenPrefix = 'payjs:';
-  // Pay.js resolves its Apple Pay compatibility check from a postMessage
-  // handler and never times out on its own.
-  const APPLE_PAY_TIMEOUT_MS = 8000;
-  const APPLE_PAY_MAX_ATTEMPTS = 2;
-  let client = null;
-  let cardEntry = null;
-  let applePay = null;
-  let applePayAttempts = 0;
-  let applePayWrapper = null;
+  const tokenPrefix = 'payarc:';
+  const walletPrefix = 'wallet:';
   let form = null;
+  let fields = null;
+  let mounting = false;
   let tokenizing = false;
-  let payJsLoading = false;
+  let walletWrapper = null;
+
+  // Appended to the helper's CSS inside each PayArc iframe: borderless
+  // inputs, so the fields read as one box drawn by css/payarcjs.css.
+  const FIELD_CSS = [
+    '.payarc-input, .payarc-input:hover, .payarc-input:focus { height: 42px; padding: 0 12px; border: 0; border-radius: 0; box-shadow: none; background: transparent; }',
+    '.payarc-input::placeholder { color: #8c8f94; }',
+    '.payarc-input-error { color: #b32d2e; }'
+  ].join('\n');
+
+  function vars() {
+    return CRM.vars[scriptName];
+  }
+
+  // payarc-hostedfields.js reads its wording from here.
+  function shareStrings() {
+    window.PayarcHostedFieldsConfig = window.PayarcHostedFieldsConfig || {};
+    window.PayarcHostedFieldsConfig.i18n = vars().i18n || {};
+  }
+
+  function str(key, fallback) {
+    return (vars() && vars().i18n && vars().i18n[key]) || fallback;
+  }
 
   // mjwshared's CRM.payment.displayError() writes to #card-errors, so the
   // template uses that id.
   function errorElement() {
     return document.getElementById('card-errors');
-  }
-
-  /**
-   * Pay.js reports validation problems in terse merchant language
-   * ("Invalid card informtion", "card number is required"); reword them.
-   */
-  function donorWording(message) {
-    const m = String(message || '').toLowerCase();
-    if (!m) {
-      return ts('Unable to validate the card.');
-    }
-    if (/expir/.test(m)) {
-      return ts('Please check the expiration date (MM/YY).');
-    }
-    if (/cvv|cvc|security|card code/.test(m)) {
-      return ts('Please check the security code (the 3 or 4 digit CVV).');
-    }
-    if (/required|length|invalid card|card number|luhn|informtion|information/.test(m)) {
-      return ts('Please check the card number, expiration date and security code.');
-    }
-    if (/public key|authenticat|unauthori|not allowed|invalid key/.test(m)) {
-      return ts('The payment form is not configured correctly, so no charge was made. Please contact us.');
-    }
-    if (/network|timeout|failed to fetch|unavailable/.test(m)) {
-      return ts('The card processor did not respond. Please wait a moment and try again.');
-    }
-    return String(message);
-  }
-
-  /**
-   * Pay.js forwards the card iframe's payload as a JSON string. A field that
-   * turns valid arrives as an "error" with code "0" and an empty message
-   * (reason "clear error"), so an empty message must stay empty: falling back
-   * to the raw JSON let its type ("cvv") match the wording rules below and
-   * showed a security-code warning once the CVV was correct.
-   */
-  function errorMessage(error) {
-    if (!error) {
-      return '';
-    }
-    if (typeof error === 'string') {
-      try {
-        const decoded = JSON.parse(error);
-        if (decoded && typeof decoded === 'object') {
-          return typeof decoded.message === 'string' ? decoded.message : '';
-        }
-      }
-      catch (ignored) {
-        // Pay.js v1 emits a plain string.
-      }
-      return error;
-    }
-    return typeof error.message === 'string' ? error.message : String(error);
   }
 
   // Riverlea's public-form CSS draws a red right-hand border on any
@@ -92,8 +63,12 @@
     });
   }
 
-  function displayError(message) {
-    const text = donorWording(message);
+  /**
+   * Show a message that is already worded for the donor (the helper words
+   * tokenization errors itself).
+   */
+  function displayError(text) {
+    text = String(text || str('unableToValidate', 'Unable to validate the card.'));
     setErrorText(text);
     if (CRM.payment && CRM.payment.displayError) {
       try {
@@ -121,10 +96,10 @@
   }
 
   function selectedProcessorIsOurs() {
-    if (!CRM.vars[scriptName]) {
+    if (!vars()) {
       return false;
     }
-    const configuredID = parseInt(CRM.vars[scriptName].id, 10);
+    const configuredID = parseInt(vars().id, 10);
     const selectedID = CRM.payment.getPaymentProcessorSelectorValue();
     return selectedID === null || typeof selectedID === 'undefined' || parseInt(selectedID, 10) === configuredID;
   }
@@ -133,8 +108,8 @@
     if (!form || !selectedProcessorIsOurs()) {
       return false;
     }
-    // Set once the key is in the form: the submit we then trigger must pass
-    // through untouched so CiviCRM's own handlers (AJAX popups use
+    // Set once the token is in the form: the submit we then trigger must
+    // pass through untouched so CiviCRM's own handlers (AJAX popups use
     // jquery.form) can process it.
     if (form.dataset.payarcjsSubmitting === 'true') {
       return false;
@@ -190,10 +165,11 @@
 
     const button = event.target && event.target.closest ? event.target.closest('[type="submit"]') : null;
 
-    // An Apple Pay key already sits in the form (the donor authorised in the
-    // sheet, then fixed a billing field); no card to tokenize.
+    // A wallet token already sits in the form (the donor paid in the wallet
+    // window, then fixed a billing field); no card to tokenize. Card tokens
+    // are never reused: every tokenization returns a fresh one.
     const existing = form.querySelector('input[name="payment_token"]');
-    if (existing && existing.value.indexOf(tokenPrefix) === 0) {
+    if (existing && existing.value.indexOf(tokenPrefix + walletPrefix) === 0) {
       submitForm(button);
       return;
     }
@@ -203,28 +179,27 @@
     setButtonsDisabled(true);
 
     try {
-      const result = await client.getPaymentKey(cardEntry);
-      if (result && result.error) {
-        throw new Error(result.error.message || result.error);
+      if (!fields) {
+        throw new Error(str('enterCard', 'Please enter your card details.'));
       }
-      const paymentKey = typeof result === 'string' ? result : (result && result.key);
-      if (!paymentKey) {
-        throw new Error(ts('PayArc did not return a payment key.'));
-      }
-      setPaymentToken(paymentKey);
+      const token = await PayarcHostedFields.tokenize(fields);
+      setPaymentToken(token);
       submitForm(button);
     }
     catch (error) {
       tokenizing = false;
       setButtonsDisabled(false);
-      displayError(errorMessage(error));
+      if (error && error.raw && window.console) {
+        window.console.warn('payarcjs: tokenization refused: ' + error.raw);
+      }
+      displayError(PayarcHostedFields.errorText(error));
       if (CRM.payment.triggerEvent) {
         CRM.payment.triggerEvent('crmBillingFormNotValid');
       }
     }
   }
 
-  function setPaymentToken(paymentKey) {
+  function setPaymentToken(value) {
     let hiddenToken = form.querySelector('input[name="payment_token"]');
     if (!hiddenToken) {
       hiddenToken = document.createElement('input');
@@ -232,12 +207,12 @@
       hiddenToken.name = 'payment_token';
       form.appendChild(hiddenToken);
     }
-    hiddenToken.value = tokenPrefix + paymentKey;
+    hiddenToken.value = tokenPrefix + value;
   }
 
   /**
-   * Submit the form with the payment key in place, through the button the
-   * donor pressed (or the first payment button for Apple Pay).
+   * Submit the form with the token in place, through the button the donor
+   * pressed (or the first payment button for a wallet).
    */
   function submitForm(button) {
     if (CRM.payment.resetBillingFieldsRequiredForJQueryValidate) {
@@ -295,119 +270,105 @@
   }
 
   /**
-   * Pay.js is an external script. In AJAX-loaded billing blocks (back-office
-   * "Submit Credit Card Contribution", WordPress AJAX forms) the region
-   * script tag can still be downloading when this runs, so load it here and
-   * mount once it arrives.
+   * Browsers do not match :focus-within on the box while focus is inside
+   * one of PayArc's cross-origin iframes, so mark it with a class. Moving
+   * between two iframes fires nothing in this page; while the page itself
+   * has no focus, check a few times a second.
    */
-  function loadPayJs(onLoad) {
-    if (typeof payarc !== 'undefined') {
-      onLoad();
-      return;
-    }
-    const url = CRM.vars[scriptName].payJsUrl;
-    let script = document.querySelector('script[data-payarcjs="payjs"]');
-    if (!script) {
-      script = document.querySelector('script[src="' + url + '"]');
-    }
-    if (!script) {
-      script = document.createElement('script');
-      script.src = url;
-      script.async = true;
-      script.dataset.payarcjs = 'payjs';
-      document.head.appendChild(script);
-    }
-    if (payJsLoading) {
-      return;
-    }
-    payJsLoading = true;
-    script.addEventListener('load', function() {
-      payJsLoading = false;
-      onLoad();
-    });
-    script.addEventListener('error', function() {
-      payJsLoading = false;
-      displayError(ts('The secure PayArc card form could not be loaded.'));
-    });
-    // The region tag may already have finished; poll briefly as a fallback.
-    let attempts = 0;
-    const poll = window.setInterval(function() {
-      if (typeof payarc !== 'undefined') {
-        window.clearInterval(poll);
-        if (payJsLoading) {
-          payJsLoading = false;
-          onLoad();
-        }
+  function trackFocus(box) {
+    let timer = null;
+    function update() {
+      const inside = box.contains(document.activeElement) && document.activeElement.tagName === 'IFRAME';
+      box.classList.toggle('payarc-focused', inside);
+      if (!document.body.contains(box) || (document.hasFocus() && !inside)) {
+        window.clearInterval(timer);
+        timer = null;
       }
-      else if (++attempts > 100) {
-        window.clearInterval(poll);
+      else if (!timer) {
+        timer = window.setInterval(update, 150);
       }
-    }, 100);
+    }
+    window.addEventListener('blur', function() {
+      window.setTimeout(update, 0);
+    });
+    window.addEventListener('focus', update);
   }
 
   function mountCardEntry() {
     const container = document.getElementById('payarcjs-card-element');
-    if (!container || container.children.length || !CRM.vars[scriptName]) {
+    if (!container || !vars() || container.dataset.payarcjsMounted === 'true' || mounting) {
       return;
     }
-    if (typeof payarc === 'undefined') {
-      loadPayJs(mountCardEntry);
+    if (typeof PayarcHostedFields === 'undefined') {
+      displayError(str('loadFailed', 'The secure PayArc card form could not be loaded.'));
       return;
     }
-
-    try {
-      client = new payarc.Client(CRM.vars[scriptName].publicKey);
-      cardEntry = client.createPaymentCardEntry();
-      // Styles are applied inside the iframe as .payjs-base / .payjs-valid /
-      // .payjs-invalid; the row is 42px to fill the 44px container.
-      // Pay.js v2 takes the class styles under 'styles'; errors are shown by
-      // this script beneath the box rather than inside the iframe.
-      cardEntry.generateHTML({
-        styles: {
-          base: {'font-size': '16px', 'height': '42px', 'line-height': '42px', 'color': '#2c3338', 'background': 'transparent'},
-          valid: {'color': '#2c3338'},
-          invalid: {'color': '#b32d2e'}
-        },
-        display_errors: false
-      });
-      cardEntry.addHTML('payarcjs-card-element');
-      // Field validation messages ("card number is required") arrive as the
-      // donor types and blurs. Show them inline only; the CRM.payment alert is
-      // reserved for tokenization failures at submit time.
-      cardEntry.addEventListener('error', function(error) {
-        const message = errorMessage(error);
-        setErrorText(message ? donorWording(message) : '');
-      });
+    shareStrings();
+    mounting = true;
+    fields = null;
+    PayarcHostedFields.mount({
+      clientId: vars().clientId,
+      scriptUrl: vars().scriptUrl,
+      container: container,
+      css: FIELD_CSS,
+      // Field validation messages arrive as the donor types and leaves a
+      // field. Show them inline only; the CRM.payment alert is reserved for
+      // tokenization failures at submit time.
+      onFieldError: function(text) {
+        setErrorText(text || '');
+      }
+    }).then(function(handles) {
+      mounting = false;
+      // The billing block may have been replaced while the script loaded;
+      // mount into the new one.
+      if (!document.body.contains(container)) {
+        load();
+        return;
+      }
+      fields = handles;
+      container.dataset.payarcjsMounted = 'true';
+      trackFocus(handles.fields);
       attachSubmitHandlers();
-      mountApplePay();
+      mountWallets();
       if (CRM.payment.triggerEvent) {
         CRM.payment.triggerEvent('crmBillingFormReloadComplete', scriptName);
       }
-    }
-    catch (error) {
-      displayError(errorMessage(error));
-    }
+    }).catch(function(error) {
+      mounting = false;
+      // A block replaced while mounting (an AJAX form reloading its billing
+      // section twice in a row) fails half-way; mount the current one.
+      if (!document.body.contains(container)) {
+        load();
+        return;
+      }
+      displayError(PayarcHostedFields.errorText(error));
+    });
   }
 
   /* ---------------------------------------------------------------------
-   * Apple Pay (Pay.js v2). One-time gifts on public pages only: the
-   * resulting key is single-use, so recurring gifts, card updates and
-   * back-office forms keep the card box.
+   * Apple Pay / Google Pay, through PayArc's wallet window. One-time gifts
+   * on public pages only: a wallet token cannot be saved, so recurring
+   * gifts, card updates and back-office forms keep the card fields. Where
+   * Apple Pay is available only Apple Pay is offered.
    * ------------------------------------------------------------------ */
 
-  function applePayAllowedHere() {
-    const cfg = CRM.vars[scriptName].applePay;
-    if (!cfg || !cfg.enabled || !window.ApplePaySession) {
-      return false;
+  function walletsWanted() {
+    const cfg = vars().wallets || {};
+    if (cfg.applePay && window.ApplePaySession) {
+      return ['apple-pay'];
     }
-    const formId = CRM.vars[scriptName].formId || form.getAttribute('id') || '';
+    return cfg.googlePay ? ['google-pay'] : [];
+  }
+
+  function walletsAllowedHere() {
+    const formId = vars().formId || form.getAttribute('id') || '';
     if (['Main', 'Register'].indexOf(formId) === -1) {
       return false;
     }
-    return formHasAmountFields();
+    return formHasAmountFields() && walletsWanted().length > 0;
   }
 
-  function applePayAmount() {
+  function walletAmount() {
     const total = Number(CRM.payment.getTotalAmount ? CRM.payment.getTotalAmount() : 0);
     return total > 0 ? total.toFixed(2) : '0.00';
   }
@@ -416,249 +377,58 @@
     return !!(CRM.payment.getIsRecur && CRM.payment.getIsRecur());
   }
 
-  function refreshApplePayVisibility() {
-    const wrapper = document.getElementById('payarcjs-apple-pay');
-    if (!wrapper || !applePay || wrapper.dataset.payarcjsAvailable !== 'true') {
+  function refreshWalletVisibility() {
+    if (walletWrapper && walletWrapper.dataset.payarcjsAvailable === 'true') {
+      walletWrapper.hidden = isRecurringSelected();
+    }
+  }
+
+  function mountWallets() {
+    const wrapper = document.getElementById('payarcjs-wallets');
+    const target = document.getElementById('payarcjs-wallet-buttons');
+    if (!wrapper || !target || wrapper.dataset.payarcjsAvailable === 'true' || !walletsAllowedHere()) {
       return;
     }
-    wrapper.hidden = isRecurringSelected();
-  }
-
-  /**
-   * Pay.js looks its relay iframe up by element id, so one left behind by an
-   * earlier attempt swallows every reply meant for a new entry.
-   */
-  function discardApplePayRelay() {
-    const relay = document.getElementById('payjs-applePayRelay');
-    if (relay && relay.parentNode) {
-      relay.parentNode.removeChild(relay);
-    }
-  }
-
-  /**
-   * Keep the card box and record why Apple Pay is missing. Pay.js gives up
-   * silently in several places, so without this the only symptom is a card
-   * box where the button should be.
-   */
-  function applePayUnavailable(wrapper, reason) {
-    wrapper.hidden = true;
-    wrapper.dataset.payarcjsError = reason;
-    if (window.console && window.console.warn) {
-      window.console.warn('payarcjs: Apple Pay not shown: ' + reason);
-    }
-  }
-
-  function remountApplePay() {
-    const target = document.getElementById('payarcjs-apple-pay-button');
-    discardApplePayRelay();
-    if (target) {
-      target.innerHTML = '';
-    }
-    applePay = null;
-    mountApplePay();
-  }
-
-  function mountApplePay() {
-    const wrapper = document.getElementById('payarcjs-apple-pay');
-    if (!wrapper || applePay || !applePayAllowedHere() || !client.createApplePayEntry) {
-      return;
-    }
-    const cfg = CRM.vars[scriptName].applePay;
-    discardApplePayRelay();
-    applePayAttempts++;
-    applePay = client.createApplePayEntry({
-      targetDiv: 'payarcjs-apple-pay-button',
-      displayName: cfg.displayName,
-      paymentRequest: {
-        total: {label: cfg.displayName, amount: applePayAmount(), type: 'final'},
-        countryCode: cfg.countryCode,
-        currencyCode: cfg.currencyCode,
-        requiredBillingContactFields: ['postalAddress', 'name'],
-        requiredShippingContactFields: ['email']
-      },
-      applePayBtn: {type: 'donate', color: 'black'}
-    });
-    // Held separately so a callback that fires after the form was rebuilt
-    // cannot touch whatever entry has replaced this one.
-    const entry = applePay;
-    applePayWrapper = wrapper;
-
-    let billingPrefill = Promise.resolve();
-    entry.on('applePayPaymentAuthorized', function(event) {
-      try {
-        billingPrefill = fillBillingFromApplePay(event && event.payment ? event.payment : {});
-      }
-      catch (ignored) {
-        // Billing prefill is a convenience; the donor can complete the fields.
-        billingPrefill = Promise.resolve();
-      }
-    });
-    entry.on('applePaySuccess', function() {
-      // The state list reloads by AJAX after the country is set; wait for it
-      // so the form is not submitted with an empty required state.
-      Promise.all([client.getPaymentKey(entry), billingPrefill]).then(function(results) {
-        const result = results[0];
-        const paymentKey = typeof result === 'string' ? result : (result && result.key);
-        if (!paymentKey) {
-          throw new Error(ts('PayArc did not return a payment key.'));
-        }
+    walletWrapper = wrapper;
+    PayarcHostedFields.wallets({
+      clientId: vars().clientId,
+      scriptUrl: vars().scriptUrl,
+      targetDiv: target,
+      wallets: walletsWanted(),
+      getAmount: walletAmount,
+      onOpen: clearError,
+      onCancel: clearError,
+      onError: displayError,
+      onKey: function(token) {
         clearError();
-        setPaymentToken(paymentKey);
+        setPaymentToken(walletPrefix + token);
         if (CRM.payment.validateForm && !CRM.payment.validateForm()) {
-          displayError(ts('Apple Pay approved the payment. Please complete the highlighted fields and press the button to finish.'));
+          displayError(str('walletIncomplete', 'Your wallet approved the payment. Please complete the highlighted fields and press the button to finish.'));
           return;
         }
         submitForm(paymentButton());
-      }).catch(function(error) {
-        displayError(errorMessage(error));
-      });
-    });
-    entry.on('applePayError', function() {
-      displayError(ts('Apple Pay could not complete the payment. Please try again or enter your card details below.'));
-    });
-    entry.on('applePayCancelled', function() {
-      clearError();
-    });
-
-    // checkCompatibility() settles from a postMessage handler and carries no
-    // timeout of its own, so a reply that never arrives leaves the promise
-    // pending for ever and the button simply never appears. Build the entry
-    // again once, then give up in a way that says so.
-    let settled = false;
-    const timer = window.setTimeout(function() {
-      if (settled || !document.body.contains(wrapper)) {
+      }
+    }).then(function(row) {
+      if (!row || !document.body.contains(wrapper)) {
         return;
       }
-      settled = true;
-      if (applePayAttempts < APPLE_PAY_MAX_ATTEMPTS) {
-        remountApplePay();
-        return;
-      }
-      applePayUnavailable(wrapper, 'Pay.js did not answer the compatibility check');
-    }, APPLE_PAY_TIMEOUT_MS);
-
-    entry.checkCompatibility().then(function() {
-      if (settled || !document.body.contains(wrapper)) {
-        return;
-      }
-      settled = true;
-      window.clearTimeout(timer);
-      // load() may have cleared the module reference while this was pending.
-      applePay = entry;
-      entry.addButton();
-      wrapper.dataset.payarcjsAvailable = 'true';
-      delete wrapper.dataset.payarcjsError;
-      wrapper.hidden = isRecurringSelected();
-      const button = document.getElementById('payjs-applePayBtn');
-      if (button) {
-        // Runs before Pay.js opens the sheet: refresh the amount and refuse
-        // recurring gifts, which need a reusable card.
-        button.addEventListener('click', function(event) {
-          if (isRecurringSelected()) {
-            event.preventDefault();
-            event.stopImmediatePropagation();
-            displayError(ts('Apple Pay cannot be used for a recurring gift. Please enter your card details below.'));
-            return;
-          }
-          const amount = applePayAmount();
-          if (amount === '0.00') {
-            event.preventDefault();
-            event.stopImmediatePropagation();
-            displayError(ts('Please choose an amount before paying with Apple Pay.'));
-            return;
-          }
-          clearError();
-          entry.applePayPaymentRequest.total.amount = amount;
-        }, true);
-      }
-      $(form).on('change', '#is_recur, #auto_renew, input[name="is_pledge"]', refreshApplePayVisibility);
-    }).catch(function(error) {
-      if (settled || !document.body.contains(wrapper)) {
-        return;
-      }
-      settled = true;
-      window.clearTimeout(timer);
-      applePayUnavailable(wrapper, errorMessage(error) || String(error));
-    });
-  }
-
-  /**
-   * Copy the Apple billing contact into empty CiviCRM billing fields.
-   * Resolves once the state has been selected (or it is clear it cannot be),
-   * because changing the country reloads the state list asynchronously.
-   */
-  function fillBillingFromApplePay(payment) {
-    const cfg = CRM.vars[scriptName].applePay;
-    const locationId = CRM.vars[scriptName].billingAddressID;
-    const billing = payment.billingContact || {};
-    const shipping = payment.shippingContact || {};
-
-    function fill(id, value) {
-      const el = document.getElementById(id);
-      if (el && value && !el.value) {
-        el.value = value;
-        $(el).trigger('change');
-      }
-    }
-    fill('billing_first_name', billing.givenName);
-    fill('billing_last_name', billing.familyName);
-    fill('billing_street_address-' + locationId, (billing.addressLines || []).join(', '));
-    fill('billing_city-' + locationId, billing.locality);
-    fill('billing_postal_code-' + locationId, billing.postalCode);
-    fill('email-' + locationId, shipping.emailAddress || billing.emailAddress);
-
-    const countrySelect = document.getElementById('billing_country_id-' + locationId);
-    const stateSelect = document.getElementById('billing_state_province_id-' + locationId);
-    const iso = String(billing.countryCode || '').toUpperCase();
-    const countryId = iso && cfg.countryIds ? cfg.countryIds[iso] : null;
-    const area = String(billing.administrativeArea || '').toUpperCase();
-
-    function selectState() {
-      if (!stateSelect || !area) {
-        return;
-      }
-      let stateId = null;
-      if (cfg.stateIds && cfg.stateIds[iso] && cfg.stateIds[iso][area]) {
-        stateId = cfg.stateIds[iso][area];
-      }
-      if (!stateId) {
-        for (let i = 0; i < stateSelect.options.length; i++) {
-          if (stateSelect.options[i].text.toUpperCase() === area) {
-            stateId = stateSelect.options[i].value;
-            break;
-          }
+      // Runs before the helper opens the wallet window: refuse recurring
+      // gifts, which need a card that can be saved.
+      row.addEventListener('click', function(event) {
+        if (isRecurringSelected()) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          displayError(str('walletRecurring', 'Apple Pay and Google Pay cannot be used for a recurring gift. Please enter your card details below.'));
         }
-      }
-      if (stateId && stateSelect.querySelector('option[value="' + stateId + '"]')) {
-        $(stateSelect).val(String(stateId)).trigger('change');
-      }
-    }
-
-    return new Promise(function(resolve) {
-      if (countrySelect && countryId && String(countrySelect.value) !== String(countryId)) {
-        // The state list reloads through CiviCRM's chain-select; give it a
-        // few seconds, then carry on regardless.
-        let done = false;
-        const finish = function() {
-          if (!done) {
-            done = true;
-            selectState();
-            resolve();
-          }
-        };
-        $(stateSelect).one('crmOptionsUpdated', finish);
-        window.setTimeout(finish, 4000);
-        $(countrySelect).val(String(countryId)).trigger('change');
-      }
-      else {
-        selectState();
-        resolve();
-      }
+      }, true);
+      wrapper.dataset.payarcjsAvailable = 'true';
+      wrapper.hidden = isRecurringSelected();
+      $(form).on('change', '#is_recur, #auto_renew, input[name="is_pledge"]', refreshWalletVisibility);
     });
   }
 
   function load() {
-    if (!CRM.payment || !CRM.vars[scriptName]) {
+    if (!CRM.payment || !vars()) {
       return;
     }
     form = CRM.payment.getBillingForm();
@@ -669,13 +439,8 @@
     // A freshly (re)loaded form, e.g. after a server-side validation error in
     // an AJAX popup, starts with no tokenization in progress.
     tokenizing = false;
-    // Discard the Apple Pay entry only once the billing block it mounted into
-    // has gone. A mount still waiting on Pay.js has no button yet, and
-    // clearing it here left the pending callback with nothing to add to.
-    if (applePayWrapper && !document.body.contains(applePayWrapper)) {
-      applePay = null;
-      applePayWrapper = null;
-      applePayAttempts = 0;
+    if (walletWrapper && !document.body.contains(walletWrapper)) {
+      walletWrapper = null;
     }
     mountCardEntry();
   }
@@ -685,7 +450,12 @@
     CRM.payment.registerScript(scriptName);
   }
 
-  document.addEventListener('DOMContentLoaded', load);
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', load);
+  }
+  else {
+    window.setTimeout(load, 0);
+  }
   $(document).ajaxComplete(function(event, xhr, settings) {
     if (CRM.payment && CRM.payment.isAJAXPaymentForm && CRM.payment.isAJAXPaymentForm(settings.url)) {
       window.setTimeout(load, 0);
@@ -693,7 +463,7 @@
   });
   // Forms opened in CiviCRM popups (Change Billing Details, back-office
   // contribution) arrive as snippets; load() is idempotent, so run it on
-  // every snippet load and mount the card box if the form is present.
+  // every snippet load and mount the card fields if the form is present.
   $(document).on('crmLoad crmFormLoad', function() {
     window.setTimeout(load, 0);
   });

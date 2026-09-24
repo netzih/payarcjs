@@ -25,10 +25,20 @@ class CRM_Payarcjs_Schedule {
   public const RECONCILE_RETRY_MINUTES = 60;
 
   /**
-   * A pending installment with no matching PayArc transaction after this
-   * long is treated as never charged and handled as a decline.
+   * An installment whose answer was lost is resent with the same invoice ID
+   * (PayArc's Idempotency-Key) while it is younger than this: PayArc answers
+   * a repeated key with the original charge, or makes the charge now if the
+   * first request never arrived. PayArc does not document how long it keeps
+   * keys, so older attempts are looked up in the charge list instead.
    */
-  public const RECONCILE_NOT_FOUND_HOURS = 24;
+  public const REPLAY_WINDOW = 3600;
+
+  /**
+   * Extra margin on the lookup cutoff, so a clock or time-zone difference
+   * between the run that sent the charge and the run looking for it cannot
+   * make the lookup stop before the charge.
+   */
+  public const LOOKUP_MARGIN = 2 * 3600;
 
   /**
    * A pending installment that still cannot be reconciled after this long
@@ -38,18 +48,37 @@ class CRM_Payarcjs_Schedule {
 
   /**
    * Staff-readable, deterministic reference for one charge attempt:
-   * payarcjs-{recur id}-{scheduled date}-{attempt number}.
+   * payarcjs-{site}-{recur id}-{scheduled date}-{attempt number}.
    *
+   * It is also sent as PayArc's Idempotency-Key and metadata 'reference'.
    * The job looks the reference up before charging, so a run that repeats a
    * due date cannot charge the donor twice, and every retry after a decline
-   * gets its own attempt number and contribution record.
+   * gets its own attempt number, contribution record and key (PayArc would
+   * replay the earlier decline for a repeated key). The site tag keeps two
+   * CiviCRM sites on one PayArc account from ever sharing a key.
    */
-  public static function invoiceID(int $recurID, string $scheduledDate, int $attempt): string {
+  public static function invoiceID(int $recurID, string $scheduledDate, int $attempt, string $site = ''): string {
     $day = substr(trim($scheduledDate), 0, 10);
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $day)) {
       throw new InvalidArgumentException('Scheduled date must start with YYYY-MM-DD.');
     }
-    return 'payarcjs-' . $recurID . '-' . $day . '-' . max(0, $attempt);
+    $site = preg_replace('/[^a-z0-9]/', '', strtolower($site));
+    return 'payarcjs-' . ($site !== '' ? $site . '-' : '') . $recurID . '-' . $day . '-' . max(0, $attempt);
+  }
+
+  /**
+   * A short, stable tag for this site, derived from a site secret or URL.
+   */
+  public static function siteTag(string $seed): string {
+    return $seed === '' ? '' : substr(hash('sha256', $seed), 0, 6);
+  }
+
+  /**
+   * How to settle an attempt whose answer was lost: 'replay' (send the same
+   * request again) while PayArc is known to keep the key, else 'lookup'.
+   */
+  public static function reconcileStep(int $ageSeconds): string {
+    return $ageSeconds < self::REPLAY_WINDOW ? 'replay' : 'lookup';
   }
 
   public static function retryDate(DateTimeImmutable $now): string {
@@ -107,25 +136,21 @@ class CRM_Payarcjs_Schedule {
   }
 
   /**
-   * Last day of the month for a PayArc MMYY expiration, or NULL if unusable.
+   * Last day of the expiry month from PayArc's exp_month / exp_year, or NULL
+   * if unusable.
    */
-  public static function expiryDate(string $expiration): ?string {
-    $expiration = preg_replace('/\D/', '', $expiration);
-    if (strlen($expiration) === 4) {
-      $month = (int) substr($expiration, 0, 2);
-      $year = 2000 + (int) substr($expiration, 2, 2);
-    }
-    elseif (strlen($expiration) === 6) {
-      $month = (int) substr($expiration, 0, 2);
-      $year = (int) substr($expiration, 2, 4);
-    }
-    else {
+  public static function expiryDate(?string $month, ?string $year): ?string {
+    $month = trim((string) $month);
+    $year = trim((string) $year);
+    if (!ctype_digit($month) || !ctype_digit($year) || !in_array(strlen($year), [2, 4], TRUE)) {
       return NULL;
     }
-    if ($month < 1 || $month > 12) {
+    $monthNumber = (int) $month;
+    $yearNumber = strlen($year) === 2 ? 2000 + (int) $year : (int) $year;
+    if ($monthNumber < 1 || $monthNumber > 12) {
       return NULL;
     }
-    return (new DateTimeImmutable(sprintf('%04d-%02d-01', $year, $month)))->modify('last day of this month')->format('Y-m-d');
+    return (new DateTimeImmutable(sprintf('%04d-%02d-01', $yearNumber, $monthNumber)))->modify('last day of this month')->format('Y-m-d');
   }
 
 }

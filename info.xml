@@ -1,11 +1,10 @@
 <?xml version="1.0"?>
 <extension key="org.chabadrichmond.payarcjs" type="module">
   <file>payarcjs</file>
-  <name>PayArc Pay.js</name>
-  <description>Tokenized PayArc card payments for CiviCRM using Pay.js and the REST API.</description>
+  <name>PayArc Hosted Fields</name>
+  <description>Tokenized PayArc card payments for CiviCRM using PayArc Hosted Fields and the PayArc API, with CiviCRM-managed recurring gifts, refunds and Apple Pay / Google Pay.</description>
   <urls>
-    <url desc="Source">https://lab.civicrm.org/Chabadrichmond/payarcjs</url>
-    <url desc="PayArc Pay.js documentation">https://help.payarc.com/developer/payjs-v1/</url>
+    <url desc="PayArc API documentation">https://docs.payarc.net/</url>
   </urls>
   <license>AGPL-3.0</license>
   <authors>
@@ -14,7 +13,7 @@
       <role>Maintainer</role>
     </author>
   </authors>
-  <releaseDate>2026-09-07</releaseDate>
+  <releaseDate>2026-09-24</releaseDate>
   <version>0.1.0-dev</version>
   <develStage>alpha</develStage>
   <compatibility>

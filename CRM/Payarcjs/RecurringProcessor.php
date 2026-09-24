@@ -3,14 +3,19 @@
 use Civi\Payment\Exception\PaymentProcessorException;
 use CRM_Payarcjs_ExtensionUtil as E;
 use CRM_Payarcjs_Schedule as Schedule;
+use Payarc\Charge;
+use Payarc\DonorMessage;
 
 /**
  * Charges due, CiviCRM-managed recurring contributions.
  *
  * A deterministic invoice ID and a pending contribution are written before
- * contacting PayArc. If a worker stops after sending the request but before
- * recording the response, later runs look the attempt up at PayArc by that
- * invoice ID and record whatever happened instead of charging again.
+ * contacting PayArc. The invoice ID is sent as PayArc's Idempotency-Key. If
+ * a worker stops after sending the request but before recording the answer,
+ * a later run sends the identical request again (PayArc answers a repeated
+ * key with the original charge) or, once the key may have expired, looks the
+ * charge up by that reference, and records whatever happened instead of
+ * charging again.
  */
 class CRM_Payarcjs_RecurringProcessor {
 
@@ -120,7 +125,7 @@ class CRM_Payarcjs_RecurringProcessor {
 
     // Each retry after a conclusive decline gets its own contribution record,
     // so the invoice ID includes the attempt number.
-    $invoiceID = Schedule::invoiceID($recurID, $scheduledDate, (int) ($recur['failure_count'] ?? 0));
+    $invoiceID = Schedule::invoiceID($recurID, $scheduledDate, (int) ($recur['failure_count'] ?? 0), CRM_Core_Payment_Payarcjs::siteTag());
     $contribution = $this->findAttempt($invoiceID);
     $createdNow = FALSE;
 
@@ -163,8 +168,23 @@ class CRM_Payarcjs_RecurringProcessor {
       return 'needs_review';
     }
 
+    return $this->charge($recur, $contribution, $invoiceID, FALSE);
+  }
+
+  /**
+   * Charge the stored card for a pending attempt and record the answer.
+   *
+   * @param bool $isResend
+   *   TRUE when this repeats an earlier request whose answer was lost. The
+   *   request is identical (same invoice ID, so the same Idempotency-Key, and
+   *   the attempt's own amount), and PayArc answers it with the earlier
+   *   charge if there was one.
+   */
+  private function charge(array $recur, array $contribution, string $invoiceID, bool $isResend): string {
+    $recurID = (int) $recur['id'];
+    $amount = (string) ($contribution['total_amount'] ?? $recur['amount']);
     $paymentParams = [
-      'amount' => (string) $recur['amount'],
+      'amount' => $amount,
       'currency' => (string) $recur['currency'],
       'contact_id' => (int) $recur['contact_id'],
       'contribution_id' => (int) $contribution['id'],
@@ -177,21 +197,20 @@ class CRM_Payarcjs_RecurringProcessor {
 
     try {
       $result = $this->paymentProcessor->doPayment($paymentParams);
+      if ($isResend) {
+        $this->addNote((int) $contribution['id'], E::ts('PayArc reconciliation: the request was sent again with the same reference and PayArc answered with charge %1, which has been recorded.', [1 => $result['trxn_id']]));
+      }
       $this->recordPayment($recur, $contribution, (string) $result['trxn_id'], $result);
       return 'succeeded';
     }
     catch (PaymentProcessorException $e) {
       $gatewayMessage = (string) ($e->getErrorData()['payarcjs_gateway_message'] ?? $e->getMessage());
       if ($e->getErrorCode() === 'PAYMENT_AMBIGUOUS') {
-        // Try to settle it right away; otherwise the next run will.
-        return $this->reconcile($recur, $contribution, $invoiceID, $gatewayMessage);
+        // doPayment() has already sent it twice; the next run settles it.
+        $this->deferReconciliation($recur, $contribution, E::ts('PayArc did not give a conclusive answer. The charge will be checked again in about an hour.'), $gatewayMessage);
+        return 'reconciling';
       }
-      if ($e->getErrorCode() === 'PAYMENT_REQUIRES_ACTION') {
-        $this->stopForReview($recurID, $contribution, $gatewayMessage);
-        return 'needs_review';
-      }
-
-      $this->recordFailure($recur, $contribution, $gatewayMessage, $e->getMessage());
+      $this->recordFailure($recur, $contribution, $gatewayMessage, $this->donorWording($e));
       return 'failed';
     }
     catch (Throwable $e) {
@@ -202,55 +221,82 @@ class CRM_Payarcjs_RecurringProcessor {
   }
 
   /**
-   * Settle an attempt whose PayArc response was never received.
+   * The donor part of a decline message. The processor appends "Gateway
+   * response: ..." in staff sessions, which a job started from the
+   * Scheduled Jobs page is; that part is not for the donor email.
+   */
+  private function donorWording(PaymentProcessorException $e): string {
+    $message = $e->getMessage();
+    $marker = trim(E::ts('Gateway response: %1', [1 => '']));
+    $cut = $marker !== '' ? strpos($message, ' ' . $marker) : FALSE;
+    return $cut === FALSE ? $message : substr($message, 0, $cut);
+  }
+
+  /**
+   * Settle an attempt whose PayArc answer was never received.
    *
-   * Looks the attempt up by the orderid (our invoice ID) PayArc stored with
-   * it. An approved charge is recorded as the payment; a decline is handled
-   * like any other decline; no trace after RECONCILE_NOT_FOUND_HOURS means the
-   * charge never happened and the attempt is treated as a decline so the
-   * normal retry applies. While the picture is unclear the series stays In
-   * Progress and is re-checked after RECONCILE_RETRY_MINUTES, up to
-   * RECONCILE_GIVE_UP_DAYS, after which staff take over.
+   * - While the attempt is younger than Schedule::REPLAY_WINDOW, the
+   *   identical request is sent again: PayArc answers a repeated
+   *   Idempotency-Key with the original charge, or makes the charge now if
+   *   the first request never arrived.
+   * - After that (PayArc does not say how long it keeps keys) the charge is
+   *   looked up by its reference in the charge list, which is conclusive back
+   *   to the send time. Approved: recorded as the payment. Declined or
+   *   provably absent: handled like a decline, so the normal retry applies
+   *   with a new attempt number and key.
+   * - While PayArc cannot be asked, the series stays In Progress and is
+   *   checked again after RECONCILE_RETRY_MINUTES, up to
+   *   RECONCILE_GIVE_UP_DAYS, after which staff take over.
    */
   private function reconcile(array $recur, array $contribution, string $invoiceID, string $reason = ''): string {
     $recurID = (int) $recur['id'];
-    $now = new DateTimeImmutable('now');
-    $pendingSince = new DateTimeImmutable((string) ($contribution['receive_date'] ?? 'now'));
-    $ageHours = ($now->getTimestamp() - $pendingSince->getTimestamp()) / 3600;
+    $sentAt = strtotime((string) ($contribution['receive_date'] ?? '')) ?: time();
+    $ageSeconds = time() - $sentAt;
 
+    if (Schedule::reconcileStep($ageSeconds) === 'replay' && $this->hasUsableToken($recur)) {
+      return $this->charge($recur, $contribution, $invoiceID, TRUE);
+    }
+
+    $amount = (string) ($contribution['total_amount'] ?? $recur['amount']);
     try {
-      $found = $this->paymentProcessor->findTransactionByOrderId($invoiceID);
+      $found = $this->paymentProcessor->findChargeByReference($invoiceID, $sentAt - Schedule::LOOKUP_MARGIN, $amount);
     }
     catch (Throwable $e) {
-      if ($ageHours >= Schedule::RECONCILE_GIVE_UP_DAYS * 24) {
-        $this->stopForReview($recurID, $contribution, E::ts('PayArc could not be reached to reconcile this installment for %1 days: %2', [1 => Schedule::RECONCILE_GIVE_UP_DAYS, 2 => $e->getMessage()]));
+      if ($ageSeconds >= Schedule::RECONCILE_GIVE_UP_DAYS * 86400) {
+        $this->stopForReview($recurID, $contribution, E::ts('PayArc could not be asked about this installment for %1 days: %2', [1 => Schedule::RECONCILE_GIVE_UP_DAYS, 2 => $e->getMessage()]));
         return 'needs_review';
       }
-      $this->deferReconciliation($recur, $contribution, E::ts('PayArc could not be reached to check this installment (%1). It will be checked again in about an hour.', [1 => $e->getMessage()]), $reason);
+      $this->deferReconciliation($recur, $contribution, E::ts('PayArc could not be asked about this installment (%1). It will be checked again in about an hour.', [1 => $e->getMessage()]), $reason);
       return 'reconciling';
     }
 
-    if ($found) {
-      $resultCode = (string) ($found['result_code'] ?? '');
-      $transactionKey = (string) ($found['key'] ?? $found['refnum'] ?? '');
-      if ($resultCode === 'A' && $transactionKey !== '') {
-        $this->addNote((int) $contribution['id'], E::ts('PayArc reconciliation: the charge was found approved at PayArc (transaction %1) and has been recorded.', [1 => $transactionKey]));
-        $this->recordPayment($recur, $contribution, $transactionKey, $this->paymentProcessor->cardDetailsForCivi($found));
+    if ($found === NULL) {
+      $gateway = E::ts('No answer was received from PayArc and no charge with reference %1 was found afterwards, so the card was not charged.', [1 => $invoiceID]);
+      $this->recordFailure($recur, $contribution, $gateway, DonorMessage::donorText('', 'E0200'));
+      return 'failed';
+    }
+
+    $chargeID = Charge::id($found);
+    switch (Charge::outcome($found)) {
+      case Charge::APPROVED:
+        if ($chargeID === '') {
+          break;
+        }
+        $this->addNote((int) $contribution['id'], E::ts('PayArc reconciliation: the charge was found approved at PayArc (charge %1) and has been recorded.', [1 => $chargeID]));
+        $this->recordPayment($recur, $contribution, $chargeID, $this->paymentProcessor->cardDetailsForCivi($found));
         return 'succeeded';
-      }
-      $texts = CRM_Payarcjs_DonorMessage::fromResponse($found);
-      $this->recordFailure($recur, $contribution, E::ts('Reconciled with PayArc: %1', [1 => $texts['gateway']]), $texts['donor']);
-      return 'failed';
-    }
 
-    if ($ageHours >= Schedule::RECONCILE_NOT_FOUND_HOURS) {
-      $gateway = E::ts('No response was received from PayArc and no matching transaction was found afterwards, so the card was not charged.');
-      $this->recordFailure($recur, $contribution, $gateway, CRM_Payarcjs_DonorMessage::donorText('processor did not respond'));
-      return 'failed';
-    }
+      case Charge::DECLINED:
+        $texts = DonorMessage::fromResponse($found);
+        $this->recordFailure($recur, $contribution, E::ts('Reconciled with PayArc: %1', [1 => $texts['gateway']]), $texts['donor']);
+        return 'failed';
 
-    $this->deferReconciliation($recur, $contribution, E::ts('No response was received from PayArc. The charge was not found there yet; it will be checked again in about an hour before being retried.'), $reason);
-    return 'reconciling';
+      case Charge::REVERSED:
+        $this->stopForReview($recurID, $contribution, E::ts('PayArc charge %1 for this installment went through but has since been voided or refunded at PayArc. Record it by hand.', [1 => $chargeID]));
+        return 'needs_review';
+    }
+    $this->stopForReview($recurID, $contribution, E::ts('PayArc charge %1 for this installment has status "%2", which does not say whether the card was charged.', [1 => $chargeID, 2 => (string) ($found['status'] ?? '')]));
+    return 'needs_review';
   }
 
   private function deferReconciliation(array $recur, array $contribution, string $message, string $reason): void {
@@ -297,7 +343,7 @@ class CRM_Payarcjs_RecurringProcessor {
    */
   private function findAttempt(string $invoiceID): ?array {
     $found = \Civi\Api4\Contribution::get(FALSE)
-      ->addSelect('id', 'contribution_status_id', 'invoice_id', 'receive_date')
+      ->addSelect('id', 'contribution_status_id', 'invoice_id', 'receive_date', 'total_amount')
       ->addWhere('invoice_id', '=', $invoiceID)
       ->addWhere('is_test', 'IN', [TRUE, FALSE])
       ->setLimit(1)

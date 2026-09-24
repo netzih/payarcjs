@@ -3,21 +3,44 @@
 use Civi\Payment\Exception\PaymentProcessorException;
 use Civi\Payment\PropertyBag;
 use CRM_Payarcjs_ExtensionUtil as E;
+use Payarc\AmbiguousGatewayException;
+use Payarc\Amount;
+use Payarc\CardDetails;
+use Payarc\Charge;
+use Payarc\DonorMessage;
+use Payarc\GatewayClient;
+use Payarc\GatewayException;
+use Payarc\UnsettledPartialRefundException;
 
 /**
- * CiviCRM payment processor for PayArc Pay.js.
+ * CiviCRM payment processor for PayArc Hosted Fields.
+ *
+ * Processor record fields: signature holds the API bearer token (secret,
+ * server side only; it is a JWT of about a thousand characters, and
+ * signature is the only credential column longer than 255), user_name the
+ * Client ID (public, sent to the browser).
  */
 class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
 
   use CRM_Core_Payment_MJWTrait;
 
-  private const PAYJS_TOKEN_PREFIX = 'payjs:';
+  /**
+   * Marks the hidden payment_token as a PayArc token from this page (card
+   * fields), as opposed to a stored PaymentToken reference.
+   */
+  private const TOKEN_PREFIX = 'payarc:';
 
   /**
-   * PayArc status codes for a card transaction that has not settled yet and
-   * can therefore only be voided, not refunded.
+   * Follows TOKEN_PREFIX for a token from the Apple Pay / Google Pay window.
+   * Wallet tokens cannot be saved, so they are refused for recurring gifts.
    */
-  private const UNSETTLED_STATUS_CODES = ['N', 'P'];
+  private const WALLET_PREFIX = 'wallet:';
+
+  /**
+   * Sent as the User-Agent and metadata 'software', so the PayArc dashboard
+   * shows which integration made each charge.
+   */
+  public const SOFTWARE = 'civicrm-payarcjs/0.1';
 
   public function __construct($mode, $paymentProcessor) {
     $this->_paymentProcessor = $paymentProcessor;
@@ -25,14 +48,11 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
 
   public function checkConfig() {
     $errors = [];
-    if (trim((string) ($this->_paymentProcessor['user_name'] ?? '')) === '') {
-      $errors[] = E::ts('The PayArc API key is required.');
-    }
-    if (trim((string) ($this->_paymentProcessor['password'] ?? '')) === '') {
-      $errors[] = E::ts('The PayArc API PIN is required.');
-    }
     if (trim((string) ($this->_paymentProcessor['signature'] ?? '')) === '') {
-      $errors[] = E::ts('The Pay.js public key is required.');
+      $errors[] = E::ts('The PayArc API bearer token is required.');
+    }
+    if (trim((string) ($this->_paymentProcessor['user_name'] ?? '')) === '') {
+      $errors[] = E::ts('The PayArc Client ID is required.');
     }
     return $errors ? implode('<br>', $errors) : NULL;
   }
@@ -46,11 +66,11 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
   }
 
   /**
-   * No QuickForm payment fields: the card is entered in the Pay.js iframe and
-   * the browser script posts the resulting key as a plain 'payment_token'
-   * request parameter. Declaring it as a hidden QuickForm field makes core's
-   * BillingBlock.tpl emit notices, because hidden elements are not exposed to
-   * the template as $form.payment_token.
+   * No QuickForm payment fields: the card is entered in PayArc's Hosted
+   * Fields and the browser script posts the resulting token as a plain
+   * 'payment_token' request parameter. Declaring it as a hidden QuickForm
+   * field makes core's BillingBlock.tpl emit notices, because hidden elements
+   * are not exposed to the template as $form.payment_token.
    */
   public function getPaymentFormFields(): array {
     return [];
@@ -83,7 +103,7 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
   }
 
   /**
-   * The Pay.js key from the submitted params, the pre-approval parameters,
+   * The PayArc token from the submitted params, the pre-approval parameters,
    * or the raw request (back-office and no-confirmation-page forms submit it
    * in the same request as the charge).
    */
@@ -98,18 +118,25 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
   public function buildForm(&$form) {
     $vars = [
       'id' => (int) $this->_paymentProcessor['id'],
-      'publicKey' => trim((string) $this->_paymentProcessor['signature']),
-      'payJsUrl' => $this->getPayJsUrl(),
+      'clientId' => trim((string) $this->_paymentProcessor['user_name']),
+      'scriptUrl' => $this->getHostedFieldsUrl(),
       'formId' => (string) $form->getAttribute('id'),
-      'billingAddressID' => (int) CRM_Core_BAO_LocationType::getBilling(),
-      'applePay' => $this->applePayVars(),
+      'wallets' => [
+        'applePay' => (bool) Civi::settings()->get('payarcjs_apple_pay_enabled'),
+        'googlePay' => (bool) Civi::settings()->get('payarcjs_google_pay_enabled'),
+      ],
+      'i18n' => self::browserStrings(),
     ];
 
     Civi::resources()->addVars(E::SHORT_NAME, $vars);
     $form->assign('payarcjsVars', $vars);
 
+    // PayArc's own script (iframeprocess.js) is not added here: it declares
+    // top-level constants and must run once per page, but a region script
+    // tag is inserted again each time an AJAX form reloads its billing
+    // block. payarc-hostedfields.js loads it on demand, once.
     CRM_Core_Region::instance('billing-block')->add([
-      'scriptUrl' => $this->getPayJsUrl(),
+      'scriptUrl' => E::url('js/payarc-hostedfields.js'),
       'weight' => 90,
     ]);
     CRM_Core_Region::instance('billing-block')->add([
@@ -129,55 +156,107 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
     return FALSE;
   }
 
+  /**
+   * Wording used by the browser scripts (payarc-hostedfields.js reads these
+   * keys from window.PayarcHostedFieldsConfig.i18n).
+   */
+  private static function browserStrings(): array {
+    return [
+      'cardNumber' => E::ts('Card number'),
+      'expiry' => E::ts('MM/YY'),
+      'cvv' => E::ts('CVV'),
+      'zip' => E::ts('ZIP'),
+      'unableToValidate' => E::ts('Unable to validate the card.'),
+      'checkExpiry' => E::ts('Please check the expiration date (MM/YY).'),
+      'checkCvv' => E::ts('Please check the security code (the 3 or 4 digit CVV).'),
+      'checkZip' => E::ts('Please check the billing ZIP code.'),
+      'checkCard' => E::ts('Please check the card number, expiration date and security code.'),
+      'misconfigured' => E::ts('The payment form is not configured correctly, so no charge was made. Please contact us.'),
+      'sessionExpired' => E::ts('The card form timed out. Please enter your card details again.'),
+      'noResponse' => E::ts('The card processor did not respond. Please wait a moment and try again.'),
+      'loadFailed' => E::ts('The secure PayArc card form could not be loaded.'),
+      'noKey' => E::ts('PayArc did not return a card token.'),
+      'reload' => E::ts('The card form was reset. Please enter your card details again.'),
+      'enterCard' => E::ts('Please enter your card details.'),
+      'busy' => E::ts('Please wait, your card is being checked.'),
+      'walletTotal' => E::ts('Total'),
+      'applePay' => E::ts('Pay with Apple Pay'),
+      'googlePay' => E::ts('Pay with Google Pay'),
+      'applePayHint' => E::ts('Tap the Apple Pay button to pay.'),
+      'googlePayHint' => E::ts('Tap the Google Pay button to pay.'),
+      'chooseAmount' => E::ts('Please choose an amount before paying with a wallet.'),
+      'walletRecurring' => E::ts('Apple Pay and Google Pay cannot be used for a recurring gift. Please enter your card details below.'),
+      'walletIncomplete' => E::ts('Your wallet approved the payment. Please complete the highlighted fields and press the button to finish.'),
+      'walletFailed' => E::ts('The wallet payment could not be completed. Please try again or enter your card details below.'),
+    ];
+  }
+
   public function doPayment(&$params, $component = 'contribute') {
     $propertyBag = $this->beginDoPayment($params);
     if ((float) $propertyBag->getAmount() === 0.0) {
       return $this->setStatusPaymentCompleted([]);
     }
 
-    $paymentToken = $this->resolvePaymentToken($propertyBag, (array) $params);
-    if ($paymentToken === '') {
+    $payment = $this->resolvePaymentToken($propertyBag, (array) $params);
+    if ($payment === NULL) {
       throw new PaymentProcessorException(E::ts('No PayArc payment token was supplied. Please re-enter the card.'));
     }
 
-    $isPayJsKey = str_starts_with($paymentToken, self::PAYJS_TOKEN_PREFIX);
-    if ($isPayJsKey) {
-      $paymentToken = substr($paymentToken, strlen(self::PAYJS_TOKEN_PREFIX));
-    }
-
     $isRecurring = $propertyBag->getIsRecur();
-    $metadata = $this->buildTransactionMetadata($propertyBag);
+    $amount = number_format((float) $propertyBag->getAmount(), 2, '.', '');
+    $this->assertCurrency($propertyBag);
+    $options = $this->chargeOptions($propertyBag);
+    $client = $this->getGatewayClient();
+    $saved = NULL;
 
     try {
-      if ($isPayJsKey) {
-        $response = $this->getGatewayClient()->saleWithPaymentKey(
-          $paymentToken,
-          (string) $propertyBag->getAmount(),
-          $metadata,
-          $isRecurring
-        );
+      if ($payment['type'] === 'saved') {
+        // A stored card, charged by the recurring job: a merchant-initiated
+        // installment.
+        $response = $this->send(fn() => $client->chargeCard($payment['value'], $amount, $options + ['recurring' => TRUE]), $options['reference']);
+      }
+      elseif ($isRecurring) {
+        if ($payment['type'] === 'wallet') {
+          throw new PaymentProcessorException(E::ts('Apple Pay and Google Pay cannot be used for a recurring gift. Please enter your card details instead.'), 'PAYMENT_DECLINED');
+        }
+        // A token is single-use: save the card first, then charge the saved
+        // card, which also proves later installments can be charged.
+        try {
+          $saved = $client->saveCard($payment['value'], $this->customerFields($propertyBag));
+        }
+        catch (AmbiguousGatewayException $e) {
+          // Saving a card charges nothing, so an unclear answer here is a
+          // plain failure: the donor may safely try again.
+          throw new GatewayException('The card could not be saved at PayArc: ' . $e->getMessage(), 0, ['code' => 'E0200'], $e);
+        }
+        try {
+          $response = $this->send(fn() => $client->chargeCard($saved['reference'], $amount, $options), $options['reference']);
+        }
+        catch (GatewayException | InvalidArgumentException $e) {
+          if (!$e instanceof AmbiguousGatewayException) {
+            $this->deleteCardQuietly($client, $saved['reference']);
+          }
+          throw $e;
+        }
       }
       else {
-        $response = $this->getGatewayClient()->saleWithCardReference(
-          $paymentToken,
-          (string) $propertyBag->getAmount(),
-          $metadata
-        );
+        $response = $this->send(fn() => $client->chargeToken($payment['value'], $amount, $options), $options['reference']);
       }
     }
-    catch (CRM_Payarcjs_AmbiguousGatewayException $e) {
+    catch (AmbiguousGatewayException $e) {
       Civi::log(E::SHORT_NAME)->critical($e->getMessage(), [
         'contribution_id' => $propertyBag->getter('contributionID', TRUE),
         'invoice_id' => $propertyBag->getter('invoiceID', TRUE),
+        'response' => $e->getResponseData(),
       ]);
       throw $this->ambiguousException($e->getMessage(), $e->getResponseData(), $e);
     }
-    catch (CRM_Payarcjs_GatewayException|InvalidArgumentException $e) {
-      throw $this->donorException($e->getMessage(), 'EXTERNAL_FAILURE', $e);
+    catch (GatewayException | InvalidArgumentException $e) {
+      throw $this->donorException($e);
     }
 
     try {
-      $this->assertApproved($response);
+      $this->assertApproved($response, $client);
     }
     catch (PaymentProcessorException $e) {
       if ($e->getErrorCode() === 'PAYMENT_AMBIGUOUS') {
@@ -187,11 +266,15 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
           'response' => $response,
         ]);
       }
+      elseif ($saved) {
+        $this->deleteCardQuietly($client, $saved['reference']);
+      }
       throw $e;
     }
 
-    if (empty($response['key']) && empty($response['refnum'])) {
-      $detail = 'PayArc approved the payment but returned no transaction identifier.';
+    $chargeID = Charge::id($response);
+    if ($chargeID === '') {
+      $detail = 'PayArc approved the payment but returned no charge id.';
       Civi::log(E::SHORT_NAME)->critical($detail, [
         'contribution_id' => $propertyBag->getter('contributionID', TRUE),
         'invoice_id' => $propertyBag->getter('invoiceID', TRUE),
@@ -201,41 +284,60 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
     }
 
     $result = [
-      'trxn_id' => (string) ($response['key'] ?? $response['refnum'] ?? ''),
-      'processor_id' => (string) ($response['refnum'] ?? ''),
+      'trxn_id' => $chargeID,
+      'processor_id' => $chargeID,
     ];
 
     // Core's checkout reads card_type_id / pan_truncation back out of the
     // params it passed in, so set them there as well as on the result.
     $cardDetails = $this->cardDetailsForCivi($response);
+    if (!$cardDetails && $saved) {
+      $cardDetails = $this->cardDetailsForCivi(['card' => ['data' => $saved['card']]]);
+    }
     $result += $cardDetails;
     if (is_array($params)) {
       $params += $cardDetails;
     }
 
-    if ($isRecurring && $isPayJsKey) {
-      $savedCard = $response['savedcard'] ?? [];
-      if (!empty($savedCard['key'])) {
-        try {
-          $paymentTokenID = $this->storeReusableToken($propertyBag, $savedCard);
-          if ($paymentTokenID) {
-            $result['payment_token_id'] = $paymentTokenID;
-            $result['processor_id'] = (string) $savedCard['key'];
-          }
-          else {
-            $this->markRecurringUnusable($propertyBag, 'The approved payment could not be linked to a CiviCRM contact token.');
-          }
+    if ($saved) {
+      try {
+        $paymentTokenID = $this->storeReusableToken($propertyBag, $saved['reference'], (array) $saved['card']);
+        if ($paymentTokenID) {
+          $result['payment_token_id'] = $paymentTokenID;
+          $result['processor_id'] = $saved['reference'];
         }
-        catch (Throwable $e) {
-          $this->markRecurringUnusable($propertyBag, $e->getMessage(), $e);
+        else {
+          $this->markRecurringUnusable($propertyBag, 'The approved payment could not be linked to a CiviCRM contact token.');
         }
       }
-      else {
-        $this->markRecurringUnusable($propertyBag, 'PayArc approved the recurring payment but did not return savedcard.key.');
+      catch (Throwable $e) {
+        $this->markRecurringUnusable($propertyBag, $e->getMessage(), $e);
       }
     }
 
     return $this->setStatusPaymentCompleted($result);
+  }
+
+  /**
+   * Send a charge. When the answer is lost, send the identical request once
+   * more at once: it carries the same Idempotency-Key, so PayArc answers with
+   * the original charge (or makes it now if the first request never
+   * arrived). A request without a key is never resent.
+   */
+  private function send(callable $call, ?string $reference): array {
+    try {
+      return $call();
+    }
+    catch (AmbiguousGatewayException $e) {
+      if ($reference === NULL || $reference === '') {
+        throw $e;
+      }
+      Civi::log(E::SHORT_NAME)->warning('No conclusive answer from PayArc for {reference}; sending the same request again.', [
+        'reference' => $reference,
+        'error' => $e->getMessage(),
+      ]);
+      return $call();
+    }
   }
 
   public function supportsRefund() {
@@ -245,62 +347,75 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
   /**
    * Refund or void a payment.
    *
-   * PayArc only voids transactions that have not settled and only refunds
-   * ones that have, so the original transaction is looked up first. A full
-   * reversal of an unsettled charge is a void; a settled charge is refunded in
-   * full or in part. A partial reversal of an unsettled charge is refused
-   * because PayArc would void the whole charge instead.
+   * PayArc does not refuse a refund of an unsettled charge as documented: it
+   * voids the WHOLE charge, whatever amount was asked for. The library's
+   * reverse() therefore reads the charge first, sends a partial amount only
+   * for a charge known to have settled, and refuses otherwise
+   * (UnsettledPartialRefundException) without sending anything. A full
+   * refund of an unsettled charge comes back as a void.
+   *
+   * PayArc refunds have no id of their own, so the refund is recorded with
+   * the sale's charge id.
    */
   public function doRefund(&$params) {
-    $transactionID = trim((string) ($params['trxn_id'] ?? $params['transaction_id'] ?? ''));
-    if ($transactionID === '') {
-      throw new PaymentProcessorException(E::ts('The original PayArc transaction ID is missing.'));
+    $chargeID = trim((string) ($params['trxn_id'] ?? $params['transaction_id'] ?? ''));
+    if ($chargeID === '') {
+      throw new PaymentProcessorException(E::ts('The original PayArc charge ID is missing.'));
     }
-    $amount = isset($params['amount']) ? number_format(abs((float) $params['amount']), 2, '.', '') : NULL;
+    $amount = isset($params['amount']) && $params['amount'] !== '' ? number_format(abs((float) $params['amount']), 2, '.', '') : NULL;
+    $options = [
+      'reference' => $this->siteReference('refund-' . $chargeID . '-' . substr(bin2hex(random_bytes(4)), 0, 6)),
+      'description' => E::ts('Refund from CiviCRM'),
+    ];
 
     try {
       $client = $this->getGatewayClient();
-      $original = $this->lookupTransaction($client, $transactionID);
-      $statusCode = strtoupper((string) ($original['status_code'] ?? ''));
-      $originalAmount = isset($original['amount']) && is_numeric($original['amount']) ? (float) $original['amount'] : NULL;
-      $isFullAmount = $amount === NULL || ($originalAmount !== NULL && (float) $amount >= $originalAmount - 0.005);
-
-      if ($statusCode === 'V') {
-        throw new PaymentProcessorException(E::ts('This PayArc transaction has already been voided.'), 'EXTERNAL_FAILURE', $original);
+      // A snapshot of the sale, so a refund whose answer is lost can be
+      // settled by reading the sale again (a refund has no row of its own).
+      $remainingBefore = Charge::remainingCents($client->getCharge($chargeID));
+      try {
+        $result = $client->reverse($chargeID, $amount, $options);
       }
-      if (in_array($statusCode, self::UNSETTLED_STATUS_CODES, TRUE)) {
-        if (!$isFullAmount) {
-          throw new PaymentProcessorException(
-            E::ts('This payment has not settled at PayArc yet, so only the full amount can be reversed today. Refund the full amount now, or issue the partial refund after the batch settles (usually the next business day).'),
-            'EXTERNAL_FAILURE',
-            $original
-          );
-        }
-        $response = $client->void($transactionID);
+      catch (AmbiguousGatewayException $e) {
+        $result = $this->settleLostRefund($client, $chargeID, $remainingBefore, $e);
       }
-      else {
-        $response = $client->refund($transactionID, $amount);
-      }
-
-      $this->assertApproved($response);
-      if (empty($response['key']) && empty($response['refnum'])) {
+      $response = $result['response'];
+      if (!in_array(Charge::outcome($response), [Charge::REVERSED, Charge::APPROVED], TRUE)) {
         throw new PaymentProcessorException(
-          E::ts('PayArc approved the refund but returned no transaction identifier. Reconcile it before retrying.'),
+          E::ts('PayArc answered the refund with status "%1". Check charge %2 in the PayArc dashboard before trying again.', [1 => (string) ($response['status'] ?? ''), 2 => $chargeID]),
           'PAYMENT_AMBIGUOUS',
           $response
         );
       }
     }
-    catch (CRM_Payarcjs_AmbiguousGatewayException $e) {
-      throw new PaymentProcessorException($e->getMessage(), 'PAYMENT_AMBIGUOUS', $e->getResponseData(), $e);
+    catch (UnsettledPartialRefundException $e) {
+      throw new PaymentProcessorException(
+        E::ts('This payment has not settled at PayArc yet. Refunding part of it now would cancel the whole payment, so nothing was sent. Refund the full amount, or refund part of it after the payment settles (normally the next business day).'),
+        'EXTERNAL_FAILURE',
+        $e->getResponseData(),
+        $e
+      );
     }
-    catch (CRM_Payarcjs_GatewayException|InvalidArgumentException $e) {
-      throw new PaymentProcessorException($e->getMessage(), 'EXTERNAL_FAILURE', [], $e);
+    catch (AmbiguousGatewayException $e) {
+      throw new PaymentProcessorException(
+        E::ts('PayArc did not answer, so the refund may or may not have gone through. Check charge %1 in the PayArc dashboard before trying again. (%2)', [1 => $chargeID, 2 => $e->getMessage()]),
+        'PAYMENT_AMBIGUOUS',
+        $e->getResponseData(),
+        $e
+      );
+    }
+    catch (GatewayException | InvalidArgumentException $e) {
+      throw new PaymentProcessorException($e->getMessage(), 'EXTERNAL_FAILURE', $e instanceof GatewayException ? $e->getResponseData() : [], $e);
+    }
+
+    if ($result['action'] === 'void') {
+      Civi::log(E::SHORT_NAME)->info('PayArc charge {charge} voided in full (not yet settled) for a refund from CiviCRM.', ['charge' => $chargeID]);
+      CRM_Core_Session::setStatus(E::ts('PayArc voided charge %1 in full because it had not settled yet. The donor will not see it posted to their card.', [1 => $chargeID]), E::ts('Payment voided'), 'info');
     }
 
     // Shape expected by core Payment.create and the mjwshared refund UI.
     return [
-      'refund_trxn_id' => (string) ($response['key'] ?? $response['refnum'] ?? ''),
+      'refund_trxn_id' => $chargeID,
       'refund_status_id' => CRM_Core_PseudoConstant::getKey('CRM_Contribute_BAO_Contribution', 'contribution_status_id', 'Completed'),
       'refund_status' => 'Completed',
       'fee_amount' => 0,
@@ -308,22 +423,28 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
   }
 
   /**
-   * Fetch the original transaction so doRefund() can choose void or refund.
-   * Returns an empty array when the lookup is not possible; the caller then
-   * falls back to a plain refund, which PayArc documents as voiding an
-   * unsettled transaction itself.
+   * The refund request went out and no answer came back. The sale shows
+   * whether it went through: less left to refund than before (or voided).
+   *
+   * @return array{action: 'refund'|'void', response: array}
+   *
+   * @throws AmbiguousGatewayException
+   *   When the sale looks unchanged or cannot be read: the refund may still
+   *   be in flight, so staff must check before trying again.
    */
-  private function lookupTransaction(CRM_Payarcjs_GatewayClient $client, string $transactionID): array {
+  private function settleLostRefund(GatewayClient $client, string $chargeID, ?int $remainingBefore, AmbiguousGatewayException $lost): array {
     try {
-      return $client->getTransaction($transactionID);
+      $sale = $client->getCharge($chargeID);
     }
-    catch (CRM_Payarcjs_GatewayException $e) {
-      Civi::log(E::SHORT_NAME)->warning('Could not look up PayArc transaction {id} before refunding: {error}', [
-        'id' => $transactionID,
-        'error' => $e->getMessage(),
-      ]);
-      return [];
+    catch (Throwable $e) {
+      throw $lost;
     }
+    $remainingNow = Charge::remainingCents($sale);
+    if ($remainingBefore === NULL || $remainingNow === NULL || $remainingNow >= $remainingBefore) {
+      throw $lost;
+    }
+    $voided = in_array(strtolower((string) ($sale['status'] ?? '')), ['void', 'voided'], TRUE);
+    return ['action' => $voided ? 'void' : 'refund', 'response' => $sale];
   }
 
   protected function supportsBackOffice() {
@@ -390,10 +511,10 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
    * Replace the stored card on a recurring contribution.
    *
    * Called by CRM_Contribute_Form_UpdateBilling with the submitted billing
-   * fields plus payment_token from Pay.js. The new card is vaulted through a
-   * $1.00 authorization that is voided at once (PayArc's cc:save does not
-   * accept Pay.js keys), stored as a PaymentToken and linked to the series.
-   * A series stopped by repeated declines is reactivated.
+   * fields plus payment_token from the Hosted Fields. The new card is saved
+   * at PayArc, proved chargeable with a $1.00 authorization that is voided at
+   * once, stored as a PaymentToken and linked to the series. A series
+   * stopped by repeated declines is reactivated.
    */
   public function updateSubscriptionBillingInfo(&$message = '', $params = []) {
     try {
@@ -401,56 +522,17 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
       if (!$recurID) {
         throw new PaymentProcessorException(E::ts('The recurring contribution could not be identified.'));
       }
-      $token = $this->paymentTokenFromRequest($params);
-      if (!str_starts_with($token, self::PAYJS_TOKEN_PREFIX)) {
+      $payment = $this->parseBrowserToken($this->paymentTokenFromRequest($params));
+      if ($payment === NULL || $payment['type'] !== 'token') {
         throw new PaymentProcessorException(E::ts('No new card was supplied. Please re-enter the card details.'));
       }
-      $paymentKey = substr($token, strlen(self::PAYJS_TOKEN_PREFIX));
 
       $recur = civicrm_api3('ContributionRecur', 'getsingle', ['id' => $recurID]);
-      $email = (string) ($params['email'] ?? '');
-
-      try {
-        $response = $this->getGatewayClient()->verifyAndSaveCardWithPaymentKey($paymentKey, [
-          'custid' => (string) ($recur['contact_id'] ?? ''),
-          'clientip' => CRM_Utils_System::ipAddress(),
-          'billing_address' => [
-            'firstname' => (string) ($params['first_name'] ?? ''),
-            'lastname' => (string) ($params['last_name'] ?? ''),
-            'street' => (string) ($params['street_address'] ?? ''),
-            'city' => (string) ($params['city'] ?? ''),
-            'state' => $this->stateAbbreviation((string) ($params['state_province'] ?? '')),
-            'postalcode' => (string) ($params['postal_code'] ?? ''),
-            'country' => $this->alpha3Country((string) ($params['country'] ?? '')),
-            'email' => $email,
-          ],
-        ]);
-      }
-      catch (CRM_Payarcjs_GatewayException|InvalidArgumentException $e) {
-        throw $this->donorException($e->getMessage(), 'EXTERNAL_FAILURE', $e);
-      }
-      $this->assertApproved($response);
-
-      $savedCard = $response['savedcard'] ?? [];
-      if (empty($savedCard['key'])) {
-        throw new PaymentProcessorException(E::ts('PayArc accepted the card but did not return a card reference.'));
-      }
-      $voidWarning = '';
-      if (!empty($response['void_error'])) {
-        Civi::log(E::SHORT_NAME)->warning('Card verification authorization {refnum} on recurring contribution {recur} was not voided: {error}', [
-          'refnum' => $response['refnum'] ?? '',
-          'recur' => $recurID,
-          'error' => $response['void_error'],
-        ]);
-        $voidWarning = E::ts('Note for staff: the %1 verification authorization (PayArc ref %2) could not be voided (%3). It will expire on its own, or void it in the PayArc console.', [
-          1 => CRM_Utils_Money::format(CRM_Payarcjs_GatewayClient::CARD_VERIFICATION_AMOUNT),
-          2 => $response['refnum'] ?? '',
-          3 => $response['void_error'],
-        ]);
-      }
+      $contactID = (int) $recur['contact_id'];
+      $email = trim((string) ($params['email'] ?? ''));
 
       $bag = new PropertyBag();
-      $bag->setContactID((int) $recur['contact_id']);
+      $bag->setContactID($contactID);
       $bag->setContributionRecurID($recurID);
       if ($email !== '') {
         $bag->setEmail($email);
@@ -461,7 +543,55 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
       if (!empty($params['last_name'])) {
         $bag->setLastName((string) $params['last_name']);
       }
-      $paymentTokenID = $this->storeReusableToken($bag, $savedCard);
+
+      $client = $this->getGatewayClient();
+      try {
+        $saved = $client->saveCard($payment['value'], $this->customerFields($bag, [
+          'address_1' => (string) ($params['street_address'] ?? ''),
+          'city' => (string) ($params['city'] ?? ''),
+          'state' => $this->stateAbbreviation((string) ($params['state_province'] ?? '')),
+          'zip' => (string) ($params['postal_code'] ?? ''),
+          'country' => (string) ($params['country'] ?? ''),
+        ]));
+      }
+      catch (GatewayException | InvalidArgumentException $e) {
+        throw $this->donorException($e);
+      }
+
+      try {
+        $verification = $client->verifyCard($saved['reference'], [
+          'reference' => $this->siteReference('verify-' . $recurID . '-' . substr(bin2hex(random_bytes(4)), 0, 6)),
+          'description' => E::ts('Card verification for recurring contribution %1', [1 => $recurID]),
+          'metadata' => ['contact_id' => $contactID, 'contribution_recur' => $recurID],
+        ]);
+        if (!Charge::approved($verification)) {
+          $texts = $this->donorTexts($verification);
+          throw new PaymentProcessorException($this->withStaffDetail($texts['donor'], $texts['gateway']), 'PAYMENT_DECLINED', $verification + ['payarcjs_gateway_message' => $texts['gateway']]);
+        }
+      }
+      catch (GatewayException | InvalidArgumentException | PaymentProcessorException $e) {
+        $this->deleteCardQuietly($client, $saved['reference']);
+        if ($e instanceof AmbiguousGatewayException) {
+          throw $this->ambiguousException($e->getMessage(), $e->getResponseData(), $e);
+        }
+        throw $e instanceof PaymentProcessorException ? $e : $this->donorException($e);
+      }
+
+      $voidWarning = '';
+      if (!empty($verification['void_error'])) {
+        Civi::log(E::SHORT_NAME)->warning('Card verification authorization {charge} on recurring contribution {recur} was not voided: {error}', [
+          'charge' => Charge::id($verification),
+          'recur' => $recurID,
+          'error' => $verification['void_error'],
+        ]);
+        $voidWarning = E::ts('Note for staff: the %1 verification authorization (PayArc charge %2) could not be voided (%3). It expires on its own after seven days, or void it in the PayArc dashboard.', [
+          1 => CRM_Utils_Money::format(GatewayClient::CARD_VERIFICATION_AMOUNT),
+          2 => Charge::id($verification),
+          3 => $verification['void_error'],
+        ]);
+      }
+
+      $paymentTokenID = $this->storeReusableToken($bag, $saved['reference'], (array) $saved['card']);
       if (!$paymentTokenID) {
         throw new PaymentProcessorException(E::ts('The new card could not be stored in CiviCRM.'));
       }
@@ -482,9 +612,9 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
       }
       civicrm_api3('ContributionRecur', 'create', $update);
 
-      $details = CRM_Payarcjs_CardDetails::fromResponse($response);
-      $message = $details['last4']
-        ? E::ts('Card ending in %1 will be used for future charges.', [1 => $details['last4']])
+      $last4 = $saved['card']['last4'] ?? NULL;
+      $message = $last4
+        ? E::ts('Card ending in %1 will be used for future charges.', [1 => $last4])
         : E::ts('The new card will be used for future charges.');
       if ($statusName === 'Failed') {
         $message .= ' ' . E::ts('The recurring contribution has been reactivated.');
@@ -509,7 +639,7 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
    * pan_truncation fields. Returns an empty array if nothing usable came back.
    */
   public function cardDetailsForCivi(array $response): array {
-    $details = CRM_Payarcjs_CardDetails::fromResponse($response);
+    $details = CardDetails::fromResponse($response);
     $out = [];
     if ($details['last4']) {
       $out['pan_truncation'] = $details['last4'];
@@ -524,111 +654,84 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
   }
 
   /**
-   * Pay.js (v2, which carries the card entry and Apple Pay) must be loaded
-   * from the same environment as the public key, so it follows the REST URL's
-   * host: a processor pointed at sandbox.payarc.com gets the sandbox Pay.js
-   * even when it is the "live" record (useful on a development site). Falls
+   * Whether this processor talks to the PayArc sandbox. Follows the API
+   * URL's host (testapi.payarc.net), so a "live" record pointed at the
+   * sandbox (a development site) loads the sandbox card fields too. Falls
    * back to the test flag when no URL is set.
    */
-  private function getPayJsUrl(): string {
+  public function isSandbox(): bool {
     $host = strtolower((string) parse_url((string) ($this->_paymentProcessor['url_site'] ?? ''), PHP_URL_HOST));
-    $isSandbox = $host !== '' ? str_contains($host, 'sandbox') : !empty($this->_paymentProcessor['is_test']);
-    return $isSandbox
-      ? 'https://sandbox.payarc.com/js/v2/pay.js'
-      : 'https://www.payarc.com/js/v2/pay.js';
+    return $host !== '' ? str_starts_with($host, 'test') : !empty($this->_paymentProcessor['is_test']);
   }
 
   /**
-   * Apple Pay settings and the lookup tables the browser script needs to copy
-   * the Apple billing contact into CiviCRM's billing fields.
+   * PayArc Hosted Fields script, from the portal matching the API URL.
    */
-  private function applePayVars(): array {
-    $enabled = (bool) Civi::settings()->get('payarcjs_apple_pay_enabled');
-    if (!$enabled) {
-      return ['enabled' => FALSE];
-    }
-    $config = CRM_Core_Config::singleton();
-    $defaultCountryID = (int) ($config->defaultContactCountry ?? 0);
-    $isoCodes = CRM_Core_PseudoConstant::countryIsoCode();
-    $displayName = trim((string) Civi::settings()->get('payarcjs_apple_pay_display_name'));
-    if ($displayName === '') {
-      $displayName = (string) (CRM_Core_BAO_Domain::getDomain()->name ?? '');
-    }
-    // Apple returns the state as an abbreviation ("CA"); CiviCRM's select
-    // shows names, so ship abbreviation => id for the site's default country
-    // plus the two countries whose Wallet addresses carry abbreviations.
-    $stateIds = [];
-    $countryIDs = array_flip(array_map('strtoupper', $isoCodes));
-    $wanted = array_unique(array_filter([$defaultCountryID, $countryIDs['US'] ?? 0, $countryIDs['CA'] ?? 0]));
-    foreach ($wanted as $countryID) {
-      $iso = strtoupper((string) ($isoCodes[$countryID] ?? ''));
-      if ($iso === '') {
-        continue;
-      }
-      foreach (CRM_Core_PseudoConstant::stateProvinceForCountry((int) $countryID, 'abbreviation') as $id => $abbreviation) {
-        $stateIds[$iso][strtoupper((string) $abbreviation)] = (int) $id;
-      }
-    }
-    return [
-      'enabled' => TRUE,
-      'displayName' => $displayName,
-      'countryCode' => strtoupper((string) ($isoCodes[$defaultCountryID] ?? 'US')),
-      'currencyCode' => strtoupper((string) ($config->defaultCurrency ?: 'USD')),
-      'defaultCountryIso' => strtoupper((string) ($isoCodes[$defaultCountryID] ?? '')),
-      'countryIds' => array_map('intval', $countryIDs),
-      'stateIds' => $stateIds,
-    ];
+  private function getHostedFieldsUrl(): string {
+    return ($this->isSandbox() ? GatewayClient::SANDBOX_PORTAL : GatewayClient::LIVE_PORTAL) . '/js/iframeprocess.js';
   }
 
   /**
-   * Look a charge up by the orderid we sent (the contribution's invoice ID).
-   * Used by the recurring job to reconcile an attempt whose response was lost.
+   * Look a charge up by the reference (invoice ID) it was sent with. Used by
+   * the recurring job to settle an attempt whose answer was lost, once the
+   * idempotency key may have expired.
+   *
+   * @return array|null
+   *   NULL when PayArc provably has no such charge since $sentAt.
+   *
+   * @throws \Payarc\ReconciliationInconclusiveException
    */
-  public function findTransactionByOrderId(string $orderId): ?array {
-    return $this->getGatewayClient()->findTransactionByOrderId($orderId);
+  public function findChargeByReference(string $reference, int $sentAt, ?string $amount): ?array {
+    return $this->getGatewayClient()->findChargeByReference($reference, $sentAt, 5, $amount);
   }
 
   /**
-   * One page of the merchant account's transactions, newest first; used by
-   * CRM_Payarcjs_TransactionImporter.
+   * The site tag used in references this extension makes up itself, so two
+   * CiviCRM sites on one PayArc account never share an idempotency key.
    */
-  public function listGatewayTransactions(int $limit = 100, int $offset = 0): array {
-    return $this->getGatewayClient()->listTransactions($limit, $offset);
+  public static function siteTag(): string {
+    $seed = defined('CIVICRM_SITE_KEY') ? (string) CIVICRM_SITE_KEY : '';
+    if ($seed === '') {
+      $seed = (string) CRM_Core_Config::singleton()->userFrameworkBaseURL;
+    }
+    return CRM_Payarcjs_Schedule::siteTag($seed);
   }
 
-  public function getGatewayTransaction(string $transactionKey): array {
-    return $this->getGatewayClient()->getTransaction($transactionKey);
+  private function siteReference(string $suffix): string {
+    $tag = self::siteTag();
+    return 'payarcjs-' . ($tag !== '' ? $tag . '-' : '') . $suffix;
   }
 
-  public function getGatewayCustomer(string $customerKey): array {
-    return $this->getGatewayClient()->getCustomer($customerKey);
-  }
-
-  private function getGatewayClient(): CRM_Payarcjs_GatewayClient {
+  private function getGatewayClient(): GatewayClient {
     $url = trim((string) ($this->_paymentProcessor['url_site'] ?? ''));
     if ($url === '') {
-      $url = !empty($this->_paymentProcessor['is_test'])
-        ? 'https://sandbox.payarc.com/api/v2'
-        : 'https://secure.payarc.com/api/v2';
+      $url = !empty($this->_paymentProcessor['is_test']) ? GatewayClient::SANDBOX_URL : GatewayClient::LIVE_URL;
     }
-
-    return new CRM_Payarcjs_GatewayClient(
-      (string) $this->_paymentProcessor['user_name'],
-      (string) $this->_paymentProcessor['password'],
-      $url
-    );
+    try {
+      return new GatewayClient((string) $this->_paymentProcessor['signature'], $url, NULL, self::SOFTWARE);
+    }
+    catch (InvalidArgumentException $e) {
+      throw new PaymentProcessorException(E::ts('The PayArc payment processor is not configured correctly: %1', [1 => $e->getMessage()]), 'EXTERNAL_FAILURE', [], $e);
+    }
   }
 
-  private function resolvePaymentToken(PropertyBag $propertyBag, array $params): string {
+  /**
+   * What to charge: a browser token (card fields or wallet) or a stored
+   * card reference.
+   *
+   * @return array{type: 'token'|'wallet'|'saved', value: string}|null
+   */
+  private function resolvePaymentToken(PropertyBag $propertyBag, array $params): ?array {
     $token = $propertyBag->has('paymentToken') ? trim((string) $propertyBag->getPaymentToken()) : '';
     if ($token === '' && empty($params['payment_token_id'])) {
       $token = $this->paymentTokenFromRequest($params);
     }
     if ($token !== '') {
-      if (!str_starts_with($token, self::PAYJS_TOKEN_PREFIX)) {
+      $payment = $this->parseBrowserToken($token);
+      if ($payment === NULL) {
         throw new PaymentProcessorException(E::ts('The submitted PayArc payment token is not valid for browser checkout.'));
       }
-      return $token;
+      return $payment;
     }
 
     $paymentTokenID = (int) ($params['payment_token_id'] ?? 0);
@@ -643,72 +746,118 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
         if ($contactID) {
           $query['contact_id'] = $contactID;
         }
-        return (string) civicrm_api3('PaymentToken', 'getvalue', $query);
+        $reference = trim((string) civicrm_api3('PaymentToken', 'getvalue', $query));
       }
       catch (CRM_Core_Exception $e) {
         throw new PaymentProcessorException(E::ts('The selected saved payment method is unavailable.'));
       }
+      if ($reference === '') {
+        throw new PaymentProcessorException(E::ts('The selected saved payment method is unavailable.'));
+      }
+      return ['type' => 'saved', 'value' => $reference];
     }
 
-    return '';
+    return NULL;
   }
 
-  private function buildTransactionMetadata(PropertyBag $propertyBag): array {
-    $contributionID = (string) $propertyBag->getter('contributionID', TRUE, '');
-    $invoiceID = (string) $propertyBag->getter('invoiceID', TRUE, '');
-    $invoice = $contributionID !== '' ? substr($contributionID, -11) : substr($invoiceID, -11);
-
-    // PayArc's REST API takes the ISO 4217 alphabetic code ("USD"); the
-    // numeric code ("840") is rejected with "Invalid currency code".
-    $currency = strtoupper(trim((string) $propertyBag->getter('currency', TRUE, '')));
-    if ($currency !== '' && !preg_match('/^[A-Z]{3}$/', $currency)) {
-      throw new PaymentProcessorException(E::ts('Currency %1 is not supported by this PayArc integration.', [1 => $currency]));
+  /**
+   * @return array{type: 'token'|'wallet', value: string}|null
+   */
+  private function parseBrowserToken(string $token): ?array {
+    if (!str_starts_with($token, self::TOKEN_PREFIX)) {
+      return NULL;
     }
+    $value = substr($token, strlen(self::TOKEN_PREFIX));
+    $type = 'token';
+    if (str_starts_with($value, self::WALLET_PREFIX)) {
+      $value = substr($value, strlen(self::WALLET_PREFIX));
+      $type = 'wallet';
+    }
+    return $value === '' ? NULL : ['type' => $type, 'value' => $value];
+  }
 
+  /**
+   * PayArc takes USD only.
+   */
+  private function assertCurrency(PropertyBag $propertyBag): void {
+    $currency = strtoupper(trim((string) $propertyBag->getter('currency', TRUE, '')));
+    if ($currency !== '' && $currency !== 'USD') {
+      throw new PaymentProcessorException(E::ts('Currency %1 is not supported by PayArc, which accepts US dollars only.', [1 => $currency]));
+    }
+  }
+
+  /**
+   * Charge options. The invoice ID is the Idempotency-Key and metadata
+   * 'reference': core makes a new one for every submission of a
+   * contribution or event page (so a retry after a decline is not answered
+   * with the old decline), and the recurring job makes a deterministic one
+   * per installment and attempt. No top-level email or phone: CiviCRM sends
+   * the receipts, and the library always asks PayArc not to.
+   */
+  private function chargeOptions(PropertyBag $propertyBag): array {
+    $contributionID = (string) $propertyBag->getter('contributionID', TRUE, '');
+    $invoiceID = trim((string) $propertyBag->getter('invoiceID', TRUE, ''));
+    if ($invoiceID === '' && $contributionID !== '') {
+      $invoiceID = $this->siteReference('contribution-' . $contributionID);
+    }
     $contactID = (int) ($this->getContactId($propertyBag) ?? 0);
+    $name = trim((string) $propertyBag->getter('firstName', TRUE, '') . ' ' . (string) $propertyBag->getter('lastName', TRUE, ''));
 
     return [
-      'invoice' => $invoice,
-      'orderid' => $invoiceID,
-      'custid' => $contactID > 0 ? (string) $contactID : '',
+      'reference' => $invoiceID !== '' ? $invoiceID : NULL,
+      'invoice' => $contributionID,
       'description' => (string) $propertyBag->getter('description', TRUE, ''),
-      'clientip' => CRM_Utils_System::ipAddress(),
-      'currency' => $currency,
-      'billing_address' => [
-        'firstname' => (string) $propertyBag->getter('firstName', TRUE, ''),
-        'lastname' => (string) $propertyBag->getter('lastName', TRUE, ''),
-        'street' => (string) $propertyBag->getter('billingStreetAddress', TRUE, ''),
-        'city' => (string) $propertyBag->getter('billingCity', TRUE, ''),
-        'state' => (string) $propertyBag->getter('billingStateProvince', TRUE, ''),
-        'postalcode' => (string) $propertyBag->getter('billingPostalCode', TRUE, ''),
-        'country' => $this->alpha3Country((string) $propertyBag->getter('billingCountry', TRUE, '')),
-        'phone' => (string) $propertyBag->getter('phone', TRUE, ''),
-        'email' => (string) $propertyBag->getter('email', TRUE, ''),
+      'metadata' => [
+        'contact_id' => $contactID > 0 ? (string) $contactID : '',
+        'payer_name' => $name,
+        'payer_email' => (string) $propertyBag->getter('email', TRUE, ''),
+        'contribution_recur' => (string) $propertyBag->getter('contributionRecurID', TRUE, ''),
       ],
     ];
   }
 
   /**
-   * PayArc documents a three-letter country code for billing addresses.
-   * Accepts ISO alpha-2, alpha-3, or a CiviCRM country name (which is what
-   * CRM_Contribute_Form_UpdateBilling passes). Unknown values are omitted.
+   * The PayArc customer record created for a saved card (one per card).
+   * PayArc requires an email; a contact without one gets a placeholder at
+   * this site's domain, which never receives mail.
    */
-  private function alpha3Country(string $country): string {
-    $country = trim($country);
-    if (strlen($country) > 3) {
-      try {
-        $country = (string) CRM_Core_DAO::getFieldValue('CRM_Core_DAO_Country', $country, 'iso_code', 'name');
-      }
-      catch (Throwable $e) {
-        return '';
-      }
+  private function customerFields(PropertyBag $propertyBag, array $address = []): array {
+    $contactID = (int) ($this->getContactId($propertyBag) ?? 0);
+    $email = $contactID ? (string) $this->getBillingEmail($propertyBag, $contactID) : (string) $propertyBag->getter('email', TRUE, '');
+    if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+      $host = (string) parse_url((string) CRM_Core_Config::singleton()->userFrameworkBaseURL, PHP_URL_HOST);
+      $email = 'no-email@' . ($host !== '' && str_contains($host, '.') ? $host : 'example.invalid');
     }
-    return CRM_Payarcjs_Country::alpha3($country);
+    $address += [
+      'address_1' => (string) $propertyBag->getter('billingStreetAddress', TRUE, ''),
+      'city' => (string) $propertyBag->getter('billingCity', TRUE, ''),
+      'state' => (string) $propertyBag->getter('billingStateProvince', TRUE, ''),
+      'zip' => (string) $propertyBag->getter('billingPostalCode', TRUE, ''),
+      'country' => (string) $propertyBag->getter('billingCountry', TRUE, ''),
+    ];
+    return [
+      'email' => $email,
+      'name' => trim((string) $propertyBag->getter('firstName', TRUE, '') . ' ' . (string) $propertyBag->getter('lastName', TRUE, '')),
+      'description' => $contactID ? E::ts('CiviCRM contact %1', [1 => $contactID]) : E::ts('CiviCRM donor'),
+      'phone' => (string) $propertyBag->getter('phone', TRUE, ''),
+    ] + array_filter($address, static fn($value) => trim((string) $value) !== '');
+  }
+
+  private function deleteCardQuietly(GatewayClient $client, string $reference): void {
+    try {
+      $client->deleteCard($reference);
+    }
+    catch (Throwable $e) {
+      Civi::log(E::SHORT_NAME)->warning('The unused PayArc saved card {reference} could not be deleted: {error}', [
+        'reference' => $reference,
+        'error' => $e->getMessage(),
+      ]);
+    }
   }
 
   /**
-   * CRM_Contribute_Form_UpdateBilling passes the state name; PayArc wants
-   * the abbreviation. Anything already short is passed through.
+   * CRM_Contribute_Form_UpdateBilling passes the state name; send the
+   * abbreviation. Anything already short is passed through.
    */
   private function stateAbbreviation(string $state): string {
     $state = trim($state);
@@ -725,52 +874,75 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
   }
 
   /**
-   * Throw for anything but an approval. Donors get wording they can act on;
-   * the gateway's own text travels in the error data (and is appended for
-   * logged-in staff) so back-office users and logs keep the real reason.
+   * Throw for anything but an approval (Charge::outcome()). Donors get
+   * wording they can act on; the gateway's own text travels in the error
+   * data (and is appended for logged-in staff) so back-office users and
+   * logs keep the real reason.
+   *
+   * - A decline can arrive as a 2xx charge with failure_code set.
+   * - A partial approval (money moved, but not all of it) is voided and
+   *   treated as a decline; if the void fails it is ambiguous.
+   * - Anything unknown, including D0001/D0008 "duplicate (approved
+   *   previously)", is ambiguous: never tell a donor who may have been
+   *   charged that they were declined.
    */
-  private function assertApproved(array $response): void {
-    $resultCode = (string) ($response['result_code'] ?? '');
-    if ($resultCode === 'A') {
+  private function assertApproved(array $response, GatewayClient $client): void {
+    $outcome = Charge::outcome($response);
+    if ($outcome === Charge::APPROVED) {
       return;
     }
 
-    if ($resultCode === 'V') {
+    if ($outcome === Charge::DECLINED) {
+      $texts = $this->donorTexts($response);
+      $errorCode = Charge::failureCode($response) !== '' ? Charge::failureCode($response) : 'PAYMENT_DECLINED';
       throw new PaymentProcessorException(
-        E::ts('Your bank requires an additional verification step that this payment form cannot complete yet. Please try a different card or contact us.'),
-        'PAYMENT_REQUIRES_ACTION',
-        $response + ['payarcjs_gateway_message' => 'Verification required (result_code V)']
+        $this->withStaffDetail($texts['donor'], $texts['gateway']),
+        $errorCode,
+        $response + ['payarcjs_gateway_message' => $texts['gateway']]
       );
     }
 
-    if ($resultCode === 'P') {
-      throw $this->ambiguousException('PayArc partially approved this payment.', $response);
+    if ($outcome === Charge::PARTIAL) {
+      try {
+        $client->void(Charge::id($response), 'other', 'Partially approved');
+      }
+      catch (Throwable $e) {
+        throw $this->ambiguousException('PayArc approved only part of the amount and the charge could not be voided: ' . $e->getMessage(), $response, $e);
+      }
+      $gateway = 'Partially approved; the charge was voided.';
+      throw new PaymentProcessorException(
+        $this->withStaffDetail(E::ts('Your card was approved for only part of the amount, so the payment was cancelled and nothing was charged. Please try a different card.'), $gateway),
+        'PAYMENT_DECLINED',
+        $response + ['payarcjs_gateway_message' => $gateway]
+      );
     }
 
-    if (!in_array($resultCode, ['D', 'E'], TRUE)) {
-      throw $this->ambiguousException('PayArc returned an unrecognized payment result.', $response);
-    }
-
-    $texts = CRM_Payarcjs_DonorMessage::fromResponse($response);
-    $errorCode = (string) ($response['error_code'] ?? $response['errorcode'] ?? 'PAYMENT_DECLINED');
-    throw new PaymentProcessorException(
-      $this->withStaffDetail($texts['donor'], $texts['gateway']),
-      $errorCode,
-      $response + ['payarcjs_gateway_message' => $texts['gateway']]
-    );
+    throw $this->ambiguousException(sprintf('PayArc answered with status "%s" (%s), which does not say whether the card was charged.', (string) ($response['status'] ?? ''), Charge::failureCode($response) ?: 'no code'), $response);
   }
 
   /**
-   * A definitive failure before or during the gateway call (HTTP error,
-   * invalid token, connection refused): donor wording plus the real reason
-   * for staff and logs.
+   * @return array{donor: string, gateway: string}
    */
-  private function donorException(string $gatewayMessage, string $code, ?Throwable $previous = NULL): PaymentProcessorException {
+  private function donorTexts(array $response): array {
+    DonorMessage::setTranslator(static fn(string $text): string => E::ts($text));
+    return DonorMessage::fromResponse($response);
+  }
+
+  /**
+   * A definitive failure before or during the gateway call (an HTTP error
+   * answer such as a decline or a used token, or a request refused before
+   * it was sent): donor wording plus the real reason for staff and logs.
+   */
+  private function donorException(Throwable $e): PaymentProcessorException {
+    $data = $e instanceof GatewayException ? $e->getResponseData() : [];
+    $texts = $this->donorTexts($data ?: ['error' => $e->getMessage()]);
+    $gateway = $e->getMessage() !== '' ? $e->getMessage() : $texts['gateway'];
+    $code = $e instanceof GatewayException ? DonorMessage::code($data) : '';
     return new PaymentProcessorException(
-      $this->withStaffDetail(CRM_Payarcjs_DonorMessage::donorText($gatewayMessage), $gatewayMessage),
-      $code,
-      ['payarcjs_gateway_message' => $gatewayMessage],
-      $previous
+      $this->withStaffDetail($texts['donor'], $gateway),
+      $code !== '' ? $code : 'EXTERNAL_FAILURE',
+      $data + ['payarcjs_gateway_message' => $gateway],
+      $e
     );
   }
 
@@ -808,17 +980,23 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
     }
   }
 
-  private function storeReusableToken(PropertyBag $propertyBag, array $savedCard): ?int {
+  /**
+   * Store a saved card ({customer_id}:{card_id}) as a CiviCRM PaymentToken
+   * and link it to the recurring contribution.
+   *
+   * @param array $card
+   *   CardDetails::fromResponse() of the saved card.
+   */
+  private function storeReusableToken(PropertyBag $propertyBag, string $cardReference, array $card): ?int {
     $contactID = (int) ($this->getContactId($propertyBag) ?? 0);
     if (!$contactID) {
-      Civi::log(E::SHORT_NAME)->error('Cannot store PayArc token without a contact ID.');
+      Civi::log(E::SHORT_NAME)->error('Cannot store PayArc card reference without a contact ID.');
       return NULL;
     }
 
-    $cardReference = (string) $savedCard['key'];
-    // PayArc returns the expiration as MMYY; CiviCRM's expiry_date lets staff
-    // find cards that are about to expire.
-    $expiry = CRM_Payarcjs_Schedule::expiryDate((string) ($savedCard['expiration'] ?? ''));
+    // CiviCRM's expiry_date lets staff find cards that are about to expire.
+    $expiry = CRM_Payarcjs_Schedule::expiryDate($card['exp_month'] ?? NULL, $card['exp_year'] ?? NULL);
+    $masked = !empty($card['last4']) ? trim(($card['brand'] ?? '') . ' ' . str_repeat('X', 12) . $card['last4']) : '';
     $existing = civicrm_api3('PaymentToken', 'get', [
       'sequential' => 1,
       'contact_id' => $contactID,
@@ -837,7 +1015,7 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
         'email' => $this->getBillingEmail($propertyBag, $contactID),
         'billing_first_name' => (string) $propertyBag->getter('firstName', TRUE, ''),
         'billing_last_name' => (string) $propertyBag->getter('lastName', TRUE, ''),
-        'masked_account_number' => (string) ($savedCard['cardnumber'] ?? $savedCard['number'] ?? ''),
+        'masked_account_number' => $masked,
         'ip_address' => CRM_Utils_System::ipAddress(),
       ] + ($expiry ? ['expiry_date' => $expiry] : []));
       $paymentTokenID = (int) $created['id'];

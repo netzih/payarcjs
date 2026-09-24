@@ -1,6 +1,6 @@
 {
   "name": "chabadrichmond/payarcjs",
-  "description": "PayArc Pay.js payment processor for CiviCRM",
+  "description": "PayArc Hosted Fields payment processor for CiviCRM",
   "type": "civicrm-ext",
   "license": "AGPL-3.0-or-later",
   "require-dev": {
@@ -9,7 +9,10 @@
   "autoload": {
     "classmap": [
       "CRM/"
-    ]
+    ],
+    "psr-4": {
+      "Payarc\\": "lib/payarc-php/src/"
+    }
   },
   "scripts": {
     "test": "phpunit"

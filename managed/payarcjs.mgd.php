@@ -36,7 +36,7 @@ HTML;
 
 $failedTemplate = [
   'workflow_name' => 'payarcjs_recurring_failed',
-  'msg_title' => E::ts('PayArc Pay.js - Recurring Payment Failed'),
+  'msg_title' => E::ts('PayArc - Recurring Payment Failed'),
   'msg_subject' => E::ts('Your recurring gift to {domain.name} could not be processed'),
   'msg_text' => $failedText,
   'msg_html' => $failedHtml,
@@ -54,7 +54,7 @@ return [
       'values' => [
         'option_group_id.name' => 'msg_tpl_workflow_contribution',
         'name' => 'payarcjs_recurring_failed',
-        'label' => E::ts('PayArc Pay.js - Recurring Payment Failed'),
+        'label' => E::ts('PayArc - Recurring Payment Failed'),
         'is_active' => TRUE,
         'is_reserved' => TRUE,
       ],
@@ -94,14 +94,18 @@ return [
       'version' => 4,
       'values' => [
         'name' => 'PayArcHostedFields',
-        'title' => E::ts('PayArc Pay.js'),
-        'description' => E::ts('PayArc card payments using hosted Pay.js fields and REST API v2.'),
-        'user_name_label' => E::ts('API key'),
-        'password_label' => E::ts('API PIN'),
-        'signature_label' => E::ts('Pay.js public key'),
+        'title' => E::ts('PayArc Hosted Fields'),
+        'description' => E::ts('PayArc card payments using hosted card fields and the PayArc API v1.'),
+        // The Client ID is public and sent to the browser for the card
+        // fields. The bearer token is secret and stays on the server; it is
+        // a JWT of about a thousand characters, and signature is the only
+        // credential column longer than 255. password and subject are
+        // unused (no label hides them on the form).
+        'user_name_label' => E::ts('Client ID'),
+        'signature_label' => E::ts('API bearer token'),
         'class_name' => 'Payment_Payarcjs',
-        'url_site_default' => 'https://secure.payarc.com/api/v2',
-        'url_site_test_default' => 'https://sandbox.payarc.com/api/v2',
+        'url_site_default' => 'https://api.payarc.net/v1',
+        'url_site_test_default' => 'https://testapi.payarc.net/v1',
         'billing_mode' => 1,
         'is_recur' => TRUE,
         'is_active' => TRUE,
@@ -122,21 +126,6 @@ return [
       'api_entity' => 'Job',
       'api_action' => 'run_payment_cron',
       'parameters' => 'processor_name=PayArcHostedFields',
-      'is_active' => 1,
-    ],
-  ],
-  [
-    'name' => 'PayArcHostedFieldsImport',
-    'entity' => 'Job',
-    'update' => 'unmodified',
-    'params' => [
-      'version' => 3,
-      'run_frequency' => 'Hourly',
-      'name' => E::ts('PayArc import transactions'),
-      'description' => E::ts('Import approved PayArc sales made outside CiviCRM (from the source keys named in PayArc Pay.js Settings) as contributions, and apply their refunds and voids. Does nothing until source keys are configured.'),
-      'api_entity' => 'Payarcjs',
-      'api_action' => 'importtransactions',
-      'parameters' => '',
       'is_active' => 1,
     ],
   ],
