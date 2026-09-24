@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<extension key="org.chabadrichmond.payarcjs" type="module">
+  <file>payarcjs</file>
+  <name>PayArc Pay.js</name>
+  <description>Tokenized PayArc card payments for CiviCRM using Pay.js and the REST API.</description>
+  <urls>
+    <url desc="Source">https://lab.civicrm.org/Chabadrichmond/payarcjs</url>
+    <url desc="PayArc Pay.js documentation">https://help.payarc.com/developer/payjs-v1/</url>
+  </urls>
+  <license>AGPL-3.0</license>
+  <authors>
+    <author>
+      <name>Chabad Richmond</name>
+      <role>Maintainer</role>
+    </author>
+  </authors>
+  <releaseDate>2026-09-07</releaseDate>
+  <version>0.1.0-dev</version>
+  <develStage>alpha</develStage>
+  <compatibility>
+    <ver>6.18</ver>
+  </compatibility>
+  <requires>
+    <ext>civi_contribute</ext>
+    <ext>mjwshared</ext>
+  </requires>
+  <classloader>
+    <psr0 prefix="CRM_" path="."/>
+  </classloader>
+  <mixins>
+    <mixin>mgd-php@2.0.0</mixin>
+    <mixin>setting-php@1.0.0</mixin>
+    <mixin>setting-admin@1.1.1</mixin>
+  </mixins>
+</extension>

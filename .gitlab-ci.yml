@@ -1,0 +1,19 @@
+stages:
+  - test
+
+phpunit:
+  stage: test
+  image: composer:2
+  cache:
+    key: composer
+    paths:
+      - vendor/
+  script:
+    - composer install --no-interaction --prefer-dist
+    - composer test
+
+javascript-syntax:
+  stage: test
+  image: node:22-alpine
+  script:
+    - node --check js/payarcjs.js

@@ -1,0 +1,77 @@
+/* The Pay.js iframe is sized as height:100% of its container, and the card
+   row inside it is a single flex line, so the container needs a fixed height
+   or the iframe falls back to the browser default of 150px. */
+.payarcjs-payment-container #payarcjs-card-element {
+  box-sizing: border-box;
+  height: 44px;
+  max-width: 520px;
+  padding: 0 8px;
+  border: 1px solid #8c8f94;
+  border-radius: 4px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.payarcjs-payment-container #payarcjs-card-element iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+.payarcjs-payment-container #payarcjs-card-element:focus-within {
+  border-color: #2271b1;
+  box-shadow: 0 0 0 1px #2271b1;
+}
+
+.payarcjs-payment-container .payarcjs-card-errors:empty {
+  display: none;
+}
+
+.payarcjs-payment-container .payarcjs-card-errors {
+  max-width: 520px;
+  margin-top: 8px;
+}
+
+.payarcjs-payment-container .description {
+  max-width: 520px;
+  margin-top: 8px;
+}
+
+/* Apple Pay button (rendered by Pay.js as an -apple-pay-button div) above the
+   card box, with a divider. The whole block stays hidden unless Pay.js
+   confirms Apple Pay is available in this browser and on this account. */
+.payarcjs-payment-container .payarcjs-apple-pay {
+  max-width: 520px;
+  margin-bottom: 12px;
+}
+
+.payarcjs-payment-container .payarcjs-apple-pay-button {
+  min-height: 40px;
+}
+
+.payarcjs-payment-container .payarcjs-apple-pay-button .apple-pay-button {
+  width: 100%;
+  height: 44px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.payarcjs-payment-container .payarcjs-apple-pay-divider {
+  display: flex;
+  align-items: center;
+  margin: 12px 0 0;
+  color: #646970;
+  font-size: 0.9em;
+}
+
+.payarcjs-payment-container .payarcjs-apple-pay-divider::before,
+.payarcjs-payment-container .payarcjs-apple-pay-divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid #c3c4c7;
+}
+
+.payarcjs-payment-container .payarcjs-apple-pay-divider span {
+  padding: 0 10px;
+}
