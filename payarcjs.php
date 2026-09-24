@@ -44,7 +44,8 @@ function payarcjs_civicrm_buildForm($formName, &$form): void {
  *
  * Flags PayArc processors with missing or rejected credentials or an API URL
  * that does not match their live/test mode, In Progress series without a
- * stored card, and a disabled recurring-payment job.
+ * stored card, a disabled recurring-payment job, and card payments paused
+ * by the card-testing limits.
  */
 function payarcjs_civicrm_check(&$messages, $statusNames = [], $includeDisabled = FALSE): void {
   $processors = \Civi\Api4\PaymentProcessor::get(FALSE)
@@ -121,6 +122,7 @@ function payarcjs_civicrm_check(&$messages, $statusNames = [], $includeDisabled 
   }
 
   payarcjs_check_recurs_without_token($messages, array_map('intval', $processors->column('id')));
+  payarcjs_check_velocity($messages);
 
   if ($hasLiveProcessor) {
     $activeJobs = \Civi\Api4\Job::get(FALSE)
@@ -236,4 +238,30 @@ function payarcjs_check_recurs_without_token(array &$messages, array $processorI
     \Psr\Log\LogLevel::WARNING,
     'fa-credit-card'
   );
+}
+
+/**
+ * Card payments paused by the card-testing limits, with a resume action.
+ */
+function payarcjs_check_velocity(array &$messages): void {
+  $until = CRM_Payarcjs_Velocity::singleton()->guard()->pausedUntil();
+  if ($until === NULL) {
+    return;
+  }
+  $message = new CRM_Utils_Check_Message(
+    'payarcjsVelocity_paused',
+    E::ts('Online card payments through PayArc are paused until %1 because too many payments were declined in a short time, which is what card testing (a bot trying stolen cards) looks like. Donors are asked to try again later; staff can still take payments on back-office forms. The limits are under Administer > System Settings > PayArc.', [
+      1 => CRM_Utils_Date::customFormat(date('Y-m-d H:i:s', $until)),
+    ]),
+    E::ts('PayArc: card payments paused'),
+    \Psr\Log\LogLevel::ERROR,
+    'fa-shield'
+  );
+  $message->addAction(
+    E::ts('Resume card payments'),
+    E::ts('Resume online card payments now? If the attack is still going on, payments will pause again after the next run of declines.'),
+    'api3',
+    ['Payarcjs', 'resume']
+  );
+  $messages[] = $message;
 }

@@ -3,7 +3,7 @@
 use CRM_Payarcjs_ExtensionUtil as E;
 
 /**
- * Wallet buttons. The settings page is created by the setting-admin mixin at
+ * Wallet buttons and card-testing limits. The settings page is created by the setting-admin mixin at
  * civicrm/admin/setting/payarcjs (Administer > System Settings).
  */
 return [
@@ -28,5 +28,65 @@ return [
     'title' => E::ts('Offer Google Pay on contribution pages'),
     'description' => E::ts('Shows a "Pay with Google Pay" button above the card fields for one-time gifts, in browsers where Apple Pay is not offered. Google Pay opens in a small PayArc window. Recurring gifts, back-office forms and card updates always use the card fields.'),
     'settings_pages' => ['payarcjs' => ['weight' => 2]],
+  ],
+  'payarcjs_velocity_ip_limit' => [
+    'name' => 'payarcjs_velocity_ip_limit',
+    'type' => 'Integer',
+    'html_type' => 'text',
+    'html_attributes' => ['size' => 4],
+    'default' => 5,
+    'is_domain' => 1,
+    'is_contact' => 0,
+    'title' => E::ts('Card-testing protection: declines per IP address'),
+    'description' => E::ts('Bots test stolen cards by running many small payments through a contribution page, most of them declined. After this many declined or refused payments from one IP address within 60 minutes, that address is refused until an hour has passed since its first decline. Recurring installments are never counted or blocked, and staff with "edit contributions" are never blocked. 0 turns this off.'),
+    'settings_pages' => ['payarcjs' => ['weight' => 10]],
+  ],
+  'payarcjs_velocity_site_limit' => [
+    'name' => 'payarcjs_velocity_site_limit',
+    'type' => 'Integer',
+    'html_type' => 'text',
+    'html_attributes' => ['size' => 4],
+    'default' => 20,
+    'is_domain' => 1,
+    'is_contact' => 0,
+    'title' => E::ts('Card-testing protection: declines site-wide'),
+    'description' => E::ts('After this many declined or refused payments from any addresses within 60 minutes, online card payments pause and the alert address is emailed. Attacks rotate IP addresses, so this is the limit that stops them. Raise it if a busy event could bring this many genuine declines in an hour. 0 turns this off.'),
+    'settings_pages' => ['payarcjs' => ['weight' => 11]],
+  ],
+  'payarcjs_velocity_pause_minutes' => [
+    'name' => 'payarcjs_velocity_pause_minutes',
+    'type' => 'Integer',
+    'html_type' => 'text',
+    'html_attributes' => ['size' => 4],
+    'default' => 60,
+    'is_domain' => 1,
+    'is_contact' => 0,
+    'title' => E::ts('Card-testing protection: pause length (minutes)'),
+    'description' => E::ts('How long card payments stay paused. System Status shows a pause and can resume payments sooner.'),
+    'settings_pages' => ['payarcjs' => ['weight' => 12]],
+  ],
+  'payarcjs_velocity_alert_email' => [
+    'name' => 'payarcjs_velocity_alert_email',
+    'type' => 'String',
+    'html_type' => 'text',
+    'html_attributes' => ['size' => 40],
+    'default' => '',
+    'is_domain' => 1,
+    'is_contact' => 0,
+    'title' => E::ts('Card-testing protection: alert email'),
+    'description' => E::ts('Emailed once each time card payments pause. Blank uses the default "From" address of this organization.'),
+    'settings_pages' => ['payarcjs' => ['weight' => 13]],
+  ],
+  'payarcjs_velocity_min_amount' => [
+    'name' => 'payarcjs_velocity_min_amount',
+    'type' => 'String',
+    'html_type' => 'text',
+    'html_attributes' => ['size' => 8],
+    'default' => '0',
+    'is_domain' => 1,
+    'is_contact' => 0,
+    'title' => E::ts('Card-testing protection: minimum card payment'),
+    'description' => E::ts('Payments below this amount are refused (card testers use small amounts). 0 allows any amount. Card updates are not affected.'),
+    'settings_pages' => ['payarcjs' => ['weight' => 14]],
   ],
 ];

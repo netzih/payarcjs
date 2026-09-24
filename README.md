@@ -255,6 +255,39 @@ and misconfiguration. Logged-in staff also see "Gateway response: ..." with
 PayArc's text and code, which is what the log and the notes on failed
 installments carry.
 
+## Card-testing protection
+
+Bots test stolen cards by running many small gifts through a contribution
+page, most of them declined. Administer > System Settings > PayArc sets
+limits on this:
+
+- **Declines per IP address** (default 5 in 60 minutes). After that, the
+  address is refused until an hour has passed since its first decline.
+- **Declines site-wide** (default 20 in 60 minutes). After that, online card
+  payments pause (default 60 minutes) and the **alert email** (default: the
+  organization's "From" address) gets one message. System Status shows the
+  pause, and its **Resume card payments** action (API3 `Payarcjs.resume`,
+  which needs administer CiviCRM) lifts it early.
+- **Minimum card payment** (default off).
+
+What counts and who is affected:
+- Declines, and PayArc's refusals of a token or card, count, on
+  contribution and event pages and on card updates. Unclear answers do not
+  count.
+- A malformed token is refused before anything is sent to PayArc and is not
+  counted.
+- Donors see only "try again later" wording.
+- The recurring job, which charges saved cards, is never counted or
+  blocked.
+- Staff with "edit contributions" are never counted or blocked, so
+  back-office payments work during a pause.
+- The state lives in the `long` cache.
+
+The IP address comes from `CRM_Utils_System::ipAddress()`. Behind a proxy
+that does not restore the visitor's address, set the per-IP limit to 0 and
+rely on the site-wide one. The limits complement reCAPTCHA on contribution
+pages; they do not replace it.
+
 ## System Status
 
 Administer > Administration Console > System Status reports, for each
@@ -265,7 +298,8 @@ active PayArc processor:
 - a bearer token or Client ID that PayArc refuses (checked without charging,
   and cached for six hours; an unreachable PayArc reports nothing);
 - In Progress series with no stored card, which the job can never charge;
-- a disabled recurring job.
+- a disabled recurring job;
+- card payments paused by the card-testing limits, with a resume action.
 
 ## Security and operations
 
@@ -314,6 +348,13 @@ Browser (`~/.config/payarc/browser/civi-test.mjs`, Playwright):
 - mjwshared refund form: partial refused, full voided;
 - Google Pay button shown for one-time gifts, hidden for monthly;
 - page scrolling, and the card box's focus ring, checked separately.
+
+Browser (`~/.config/payarc/browser/velocity-civi.mjs`, an anonymous donor on
+the live page, with low limits):
+- per-IP refusal after two refused tokens;
+- site-wide pause, with the alert email and the System Status message;
+- a gift refused during the pause;
+- `Payarcjs.resume` (refused to anonymous callers), then a gift approved.
 
 Not yet exercised:
 - Apple Pay and Google Pay sheets in this extension (they need a real HTTPS

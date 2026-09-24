@@ -205,6 +205,12 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
     $isRecurring = $propertyBag->getIsRecur();
     $amount = number_format((float) $propertyBag->getAmount(), 2, '.', '');
     $this->assertCurrency($propertyBag);
+    // Payer-initiated only: the recurring job charges saved cards.
+    $velocity = $payment['type'] === 'saved' ? NULL : CRM_Payarcjs_Velocity::singleton();
+    $refusal = $velocity ? $velocity->refusal($amount) : NULL;
+    if ($refusal !== NULL) {
+      throw new PaymentProcessorException($refusal, 'PAYARCJS_REFUSED');
+    }
     $options = $this->chargeOptions($propertyBag);
     $client = $this->getGatewayClient();
     $saved = NULL;
@@ -252,6 +258,7 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
       throw $this->ambiguousException($e->getMessage(), $e->getResponseData(), $e);
     }
     catch (GatewayException | InvalidArgumentException $e) {
+      $velocity?->failed();
       throw $this->donorException($e);
     }
 
@@ -259,6 +266,9 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
       $this->assertApproved($response, $client);
     }
     catch (PaymentProcessorException $e) {
+      if ($e->getErrorCode() !== 'PAYMENT_AMBIGUOUS') {
+        $velocity?->failed();
+      }
       if ($e->getErrorCode() === 'PAYMENT_AMBIGUOUS') {
         Civi::log(E::SHORT_NAME)->critical($e->getErrorData()['payarcjs_gateway_message'] ?? $e->getMessage(), [
           'contribution_id' => $propertyBag->getter('contributionID', TRUE),
@@ -544,6 +554,11 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
         $bag->setLastName((string) $params['last_name']);
       }
 
+      $velocity = CRM_Payarcjs_Velocity::singleton();
+      $refusal = $velocity->refusal(NULL);
+      if ($refusal !== NULL) {
+        throw new PaymentProcessorException($refusal, 'PAYARCJS_REFUSED');
+      }
       $client = $this->getGatewayClient();
       try {
         $saved = $client->saveCard($payment['value'], $this->customerFields($bag, [
@@ -555,6 +570,7 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
         ]));
       }
       catch (GatewayException | InvalidArgumentException $e) {
+        $velocity->failed();
         throw $this->donorException($e);
       }
 
@@ -571,6 +587,9 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
       }
       catch (GatewayException | InvalidArgumentException | PaymentProcessorException $e) {
         $this->deleteCardQuietly($client, $saved['reference']);
+        if (!$e instanceof AmbiguousGatewayException) {
+          $velocity->failed();
+        }
         if ($e instanceof AmbiguousGatewayException) {
           throw $this->ambiguousException($e->getMessage(), $e->getResponseData(), $e);
         }
