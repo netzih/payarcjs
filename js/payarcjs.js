@@ -20,13 +20,6 @@
   let tokenizing = false;
   let walletWrapper = null;
 
-  // Appended to the helper's CSS inside each PayArc iframe: borderless
-  // inputs, so the fields read as one box drawn by css/payarcjs.css.
-  const FIELD_CSS = [
-    '.payarc-input, .payarc-input:hover, .payarc-input:focus { height: 42px; padding: 0 12px; border: 0; border-radius: 0; box-shadow: none; background: transparent; }',
-    '.payarc-input::placeholder { color: #8c8f94; }',
-    '.payarc-input-error { color: #b32d2e; }'
-  ].join('\n');
 
   function vars() {
     return CRM.vars[scriptName];
@@ -269,31 +262,6 @@
     form.addEventListener('submit', tokenizeAndSubmit, true);
   }
 
-  /**
-   * Browsers do not match :focus-within on the box while focus is inside
-   * one of PayArc's cross-origin iframes, so mark it with a class. Moving
-   * between two iframes fires nothing in this page; while the page itself
-   * has no focus, check a few times a second.
-   */
-  function trackFocus(box) {
-    let timer = null;
-    function update() {
-      const inside = box.contains(document.activeElement) && document.activeElement.tagName === 'IFRAME';
-      box.classList.toggle('payarc-focused', inside);
-      if (!document.body.contains(box) || (document.hasFocus() && !inside)) {
-        window.clearInterval(timer);
-        timer = null;
-      }
-      else if (!timer) {
-        timer = window.setInterval(update, 150);
-      }
-    }
-    window.addEventListener('blur', function() {
-      window.setTimeout(update, 0);
-    });
-    window.addEventListener('focus', update);
-  }
-
   function mountCardEntry() {
     const container = document.getElementById('payarcjs-card-element');
     if (!container || !vars() || container.dataset.payarcjsMounted === 'true' || mounting) {
@@ -310,7 +278,6 @@
       clientId: vars().clientId,
       scriptUrl: vars().scriptUrl,
       container: container,
-      css: FIELD_CSS,
       // Field validation messages arrive as the donor types and leaves a
       // field. Show them inline only; the CRM.payment alert is reserved for
       // tokenization failures at submit time.
@@ -327,7 +294,6 @@
       }
       fields = handles;
       container.dataset.payarcjsMounted = 'true';
-      trackFocus(handles.fields);
       attachSubmitHandlers();
       mountWallets();
       if (CRM.payment.triggerEvent) {

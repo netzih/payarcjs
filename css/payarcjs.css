@@ -17,7 +17,7 @@
 .payarcjs-payment-container .payarc-fields {
   /* One box, like a single card input: number, MM/YY, CVV and ZIP side by
      side with thin dividers. The inputs inside the iframes are borderless
-     (see FIELD_CSS in payarcjs.js), so this box draws the border. */
+     (DEFAULT_CSS in payarc-hostedfields.js), so this box draws the border. */
   display: grid;
   grid-template-columns: minmax(0, 1fr) 76px 60px 76px;
   box-sizing: border-box;

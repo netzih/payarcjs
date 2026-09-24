@@ -38,9 +38,9 @@ Card details are entered securely into fields hosted by PayArc.
 ```
 
 The box border lives in `css/payarcjs.css`; the borderless inputs inside
-the iframes are styled by `FIELD_CSS` in `js/payarcjs.js`. Browsers do not
-match `:focus-within` while focus is inside a cross-origin iframe, so the
-script sets `payarc-focused` on the box instead.
+the iframes are styled by `DEFAULT_CSS` in `js/payarc-hostedfields.js`.
+Browsers do not match `:focus-within` while focus is inside a cross-origin
+iframe, so the helper sets `payarc-focused` on the box instead.
 
 ## Scope
 
@@ -352,12 +352,8 @@ End-to-end checks against a CiviCRM site with a sandbox processor are in
 `tests/sandbox/` and run with `cv scr`; see the README there.
 
 `js/payarc-hostedfields.js` is a copy of the WordPress plugin's
-`assets/js/payarc-hostedfields.js`, with two changes. A guard stops a
-reloaded AJAX billing block from running it again. And the
-`<style id="payarc-styles">` element it adds is marked `media="not all"`:
-that CSS is for inside PayArc's iframes (which read the element's text), and
-applied to the page itself its `html, body { overflow: hidden }` stopped the
-page from scrolling. Keep the two copies in step.
+`assets/js/payarc-hostedfields.js`, with one guard added so a reloaded AJAX
+billing block does not run it again. Keep the two copies in step.
 
 ## License
 
