@@ -4,6 +4,8 @@
   <name>PayArc Hosted Fields</name>
   <description>Tokenized PayArc card payments for CiviCRM using PayArc Hosted Fields and the PayArc API, with CiviCRM-managed recurring gifts, refunds and Apple Pay / Google Pay.</description>
   <urls>
+    <url desc="Main Extension Page">https://github.com/netzih/payarcjs</url>
+    <url desc="Support">https://github.com/netzih/payarcjs/issues</url>
     <url desc="PayArc API documentation">https://docs.payarc.net/</url>
   </urls>
   <license>AGPL-3.0</license>
@@ -14,7 +16,7 @@
     </author>
   </authors>
   <releaseDate>2026-09-24</releaseDate>
-  <version>0.1.0-dev</version>
+  <version>0.1.0</version>
   <develStage>alpha</develStage>
   <compatibility>
     <ver>6.18</ver>
