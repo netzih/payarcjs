@@ -41,6 +41,18 @@ return [
     'description' => E::ts('Bots test stolen cards by running many small payments through a contribution page, most of them declined. After this many declined or refused payments from one IP address within 60 minutes, that address is refused until an hour has passed since its first decline. Recurring installments are never counted or blocked, and staff with "edit contributions" are never blocked. 0 turns this off.'),
     'settings_pages' => ['payarcjs' => ['weight' => 10]],
   ],
+  'payarcjs_client_ip_header' => [
+    'name' => 'payarcjs_client_ip_header',
+    'type' => 'String',
+    'html_type' => 'text',
+    'html_attributes' => ['size' => 24],
+    'default' => '',
+    'is_domain' => 1,
+    'is_contact' => 0,
+    'title' => E::ts('Card-testing protection: client IP header'),
+    'description' => E::ts('Only for a site behind a proxy (such as Cloudflare) that does not pass on the visitor\'s address: without it, every payer shares the proxy\'s address and the per-IP limit refuses real donors. Enter the header the proxy sets, such as CF-Connecting-IP or X-Forwarded-For (the last address in the list is used). Leave blank otherwise: a visitor can send this header themselves, so on a site that is not behind that proxy it lets them change the address that is counted.'),
+    'settings_pages' => ['payarcjs' => ['weight' => 15]],
+  ],
   'payarcjs_velocity_site_limit' => [
     'name' => 'payarcjs_velocity_site_limit',
     'type' => 'Integer',

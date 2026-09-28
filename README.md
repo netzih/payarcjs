@@ -1,6 +1,6 @@
 # PayArc Hosted Fields for CiviCRM
 
-A card payment processor for CiviCRM 6.18 using PayArc Hosted Fields and the
+A card payment processor for CiviCRM using PayArc Hosted Fields and the
 PayArc API v1. Card number, expiry, CVV and ZIP are typed into PayArc's
 iframes (one per field) and never reach this server. The browser gets a
 single-use token, and the server charges it.
@@ -59,7 +59,8 @@ and disputes/chargebacks, which are visible only in the PayArc dashboard.
 
 ## Requirements
 
-- CiviCRM 6.18 or later with CiviContribute.
+- CiviCRM 5.78 or later with CiviContribute (the oldest version it has been
+  installed and configured on; payments have been tested on 6.x).
 - The [Payment Shared (mjwshared)](https://lab.civicrm.org/extensions/mjwshared)
   extension, which supplies the `CRM.payment` browser library and the refund
   form.
@@ -68,8 +69,11 @@ and disputes/chargebacks, which are visible only in the PayArc dashboard.
 
 ## Setup
 
-1. Put this directory in a CiviCRM extension directory (on WordPress,
-   commonly `wp-content/uploads/civicrm/ext/payarcjs`) and enable
+1. Download `payarcjs-<version>.zip` from the
+   [releases page](https://github.com/netzih/payarcjs/releases) and unzip it
+   into a CiviCRM extension directory (on WordPress, commonly
+   `wp-content/uploads/civicrm/ext/payarcjs`); a clone of this repository
+   works too, as the library is committed in `lib/payarc-php`. Then enable
    **PayArc Hosted Fields** under Administer > System Settings > Extensions.
 2. Add a processor of type **PayArc Hosted Fields** under Administer >
    CiviContribute > Payment Processors. From the PayArc dashboard (**API**,
@@ -283,9 +287,25 @@ What counts and who is affected:
   back-office payments work during a pause.
 - The state lives in the `long` cache.
 
-The IP address comes from `CRM_Utils_System::ipAddress()`. Behind a proxy
-that does not restore the visitor's address, set the per-IP limit to 0 and
-rely on the site-wide one. The limits complement reCAPTCHA on contribution
+The IP address comes from `CRM_Utils_System::ipAddress()`, which is
+`REMOTE_ADDR`. Behind a proxy that does not restore the visitor's address
+(e.g. Cloudflare without its real-IP module), every donor would share the
+proxy's address and a few ordinary declines would refuse everyone. Either:
+- set **Client IP header** to the header the proxy sets (`CF-Connecting-IP`,
+  or `X-Forwarded-For`, of which the last address is used). Only do this
+  when every request comes through that proxy: a visitor can send the
+  header themselves; or
+- supply the address in `hook_civicrm_payarcjsClientIp(&$ip)`:
+
+  ```php
+  function myext_civicrm_payarcjsClientIp(&$ip) {
+    $ip = $_SERVER['HTTP_CF_CONNECTING_IP'] ?? $ip;
+  }
+  ```
+
+The same address is recorded on saved cards (`PaymentToken.ip_address`).
+If neither is possible, set the per-IP limit to 0 and rely on the
+site-wide one. The limits complement reCAPTCHA on contribution
 pages; they do not replace it.
 
 ## System Status

@@ -78,7 +78,41 @@ class CRM_Payarcjs_Velocity implements VelocityStore {
   }
 
   private function ip(): string {
+    return self::clientIp();
+  }
+
+  /**
+   * The payer's address, as counted by the per-IP limit and recorded on
+   * saved cards. REMOTE_ADDR by default. Behind a proxy that does not
+   * restore it (e.g. Cloudflare without its real-IP module), every payer
+   * would count as the proxy, so a site can name the header the proxy sets
+   * (setting payarcjs_client_ip_header) or supply the address in
+   * hook_civicrm_payarcjsClientIp(&$ip):
+   *
+   *   function myext_civicrm_payarcjsClientIp(&$ip) {
+   *     $ip = $_SERVER['HTTP_CF_CONNECTING_IP'] ?? $ip;
+   *   }
+   *
+   * Returns '' when the result is not a valid IP address.
+   */
+  public static function clientIp(): string {
     $ip = (string) CRM_Utils_System::ipAddress();
+
+    $header = trim((string) Civi::settings()->get('payarcjs_client_ip_header'));
+    if ($header !== '') {
+      $value = (string) ($_SERVER['HTTP_' . strtoupper(str_replace('-', '_', $header))] ?? '');
+      // A list (X-Forwarded-For) ends with the address the nearest proxy saw;
+      // earlier entries come from the client and can be forged.
+      $forwarded = trim((string) strrchr(',' . $value, ','), ", \t");
+      if (filter_var($forwarded, FILTER_VALIDATE_IP)) {
+        $ip = $forwarded;
+      }
+    }
+
+    $null = NULL;
+    CRM_Utils_Hook::singleton()->invoke(['ip'], $ip, $null, $null, $null, $null, $null, 'civicrm_payarcjsClientIp');
+
+    $ip = (string) $ip;
     return filter_var($ip, FILTER_VALIDATE_IP) ? $ip : '';
   }
 

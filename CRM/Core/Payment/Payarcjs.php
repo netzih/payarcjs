@@ -1035,7 +1035,7 @@ class CRM_Core_Payment_Payarcjs extends CRM_Core_Payment {
         'billing_first_name' => (string) $propertyBag->getter('firstName', TRUE, ''),
         'billing_last_name' => (string) $propertyBag->getter('lastName', TRUE, ''),
         'masked_account_number' => $masked,
-        'ip_address' => CRM_Utils_System::ipAddress(),
+        'ip_address' => CRM_Payarcjs_Velocity::clientIp() ?: NULL,
       ] + ($expiry ? ['expiry_date' => $expiry] : []));
       $paymentTokenID = (int) $created['id'];
     }
